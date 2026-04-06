@@ -15,10 +15,11 @@ use crate::editor::{self, Editor, EditorEvent, VaultFile};
 use crate::graph::{GraphEvent, GraphView};
 use crate::icons;
 use crate::links::LinkIndex;
+use crate::search::VaultSearch;
 use crate::settings::Settings;
 use crate::theme as t;
 
-actions!(forge, [OpenFolder, Save, Quit, ToggleTheme, ToggleSidebar, NewFile, DeleteFile, CloseTab, NextTab, PrevTab, RefreshVault, ToggleReadableWidth, ToggleBacklinks, ShowFiles, ShowGraph, ShowSettings, NavBack, NavForward, CtxOpen, CtxOpenNewTab, CtxRename, CtxDelete, CtxCopyPath, CtxReveal, CtxDuplicate, CtxNewFileHere, CtxNewFolderHere, CtxFolderRename, CtxFolderDelete]);
+actions!(forge, [OpenFolder, Save, Quit, ToggleTheme, ToggleSidebar, NewFile, DeleteFile, CloseTab, NextTab, PrevTab, RefreshVault, ToggleReadableWidth, ToggleBacklinks, ShowFiles, ShowGraph, ShowSettings, ShowSearch, NavBack, NavForward, CtxOpen, CtxOpenNewTab, CtxRename, CtxDelete, CtxCopyPath, CtxReveal, CtxDuplicate, CtxNewFileHere, CtxNewFolderHere, CtxFolderRename, CtxFolderDelete]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidePanel {
@@ -156,6 +157,11 @@ pub struct ForgeApp {
     font_dropdown: Option<&'static str>,
     /// Whether settings have been modified since last save.
     settings_dirty: bool,
+    vault_search: Option<VaultSearch>,
+    search_query: String,
+    search_results: Vec<crate::search::SearchResult>,
+    search_input: Entity<InputState>,
+    search_visible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +204,35 @@ impl ForgeApp {
 
         // Graph view entity
         let graph_view = cx.new(|cx| GraphView::new(cx));
+        // Search input
+        let search_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(&search_input, |this: &mut Self, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Change => {
+                    this.search_query = this.search_input.read(cx).value().to_string();
+                    // Execute search
+                    if let Some(vs) = &this.vault_search {
+                        if !this.search_query.trim().is_empty() {
+                            this.search_results = vs.search(&this.search_query, 20).unwrap_or_default();
+                        } else {
+                            this.search_results.clear();
+                        }
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    // Open the first result if available
+                    if let Some(first) = this.search_results.first() {
+                        let path = first.chunk.file_path.clone();
+                        this.search_visible = false;
+                        this.side_panel = SidePanel::Files;
+                        this.open_path_as_tab(path, cx, false);
+                    }
+                }
+                _ => {}
+            }
+        }).detach();
+
         cx.subscribe(&graph_view, |this: &mut Self, _, event: &GraphEvent, cx| {
             match event {
                 GraphEvent::OpenNote(path) => {
@@ -230,6 +265,11 @@ impl ForgeApp {
             ctx_is_folder: false,
             font_dropdown: None,
             settings_dirty: false,
+            vault_search: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_input,
+            search_visible: false,
         };
 
         // Auto-load last vault (or default test vault)
@@ -282,6 +322,13 @@ impl ForgeApp {
         self.refresh_file_tree();
         // Build the wikilink index (scans content of every .md file).
         self.link_index = LinkIndex::scan_vault(&path);
+        // Build search index
+        let db_path = dirs::config_dir().unwrap_or_default().join("forge").join("forge.db");
+        let idx_path = dirs::config_dir().unwrap_or_default().join("forge").join("vault.usearch");
+        if let Ok(mut vs) = VaultSearch::new(&db_path, &idx_path) {
+            let _ = vs.build_vault(&path);
+            self.vault_search = Some(vs);
+        }
     }
 
     fn refresh_file_tree(&mut self) {
@@ -701,6 +748,13 @@ impl ForgeApp {
     fn show_settings(&mut self, _: &ShowSettings, _w: &mut Window, cx: &mut Context<Self>) {
         self.side_panel = SidePanel::Settings; cx.notify();
     }
+    fn show_search(&mut self, _: &ShowSearch, w: &mut Window, cx: &mut Context<Self>) {
+        self.search_visible = !self.search_visible;
+        if self.search_visible {
+            w.focus(&self.search_input.read(cx).focus_handle(cx));
+        }
+        cx.notify();
+    }
 
     fn _consume_backspace(&mut self, _: &editor::Backspace, _: &mut Window, _: &mut Context<Self>) {}
     fn _consume_delete(&mut self, _: &editor::Delete, _: &mut Window, _: &mut Context<Self>) {}
@@ -945,7 +999,10 @@ impl ForgeApp {
         let search_btn = div().id("rail-search")
             .flex().items_center().justify_center()
             .w(px(32.)).h(px(32.)).rounded(px(t::RADIUS_MD))
-            .child(icons::rail_search_icon(muted.opacity(0.35)));
+            .bg(transparent_black())
+            .cursor_pointer().hover(move |s: gpui::StyleRefinement| s.bg(accent.opacity(0.10)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, w, cx| this.show_search(&ShowSearch, w, cx)))
+            .child(icons::rail_search_icon(muted));
 
         let graph_btn = div().id("rail-graph")
             .flex().items_center().justify_center()
@@ -1188,6 +1245,123 @@ impl ForgeApp {
                     )
             )
             .into_any_element()
+    }
+
+    fn render_search_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.search_visible { return None; }
+
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let accent = cx.theme().accent;
+        let is_dark = cx.theme().mode.is_dark();
+        let overlay_bg = if is_dark { hsla(0.0, 0.0, 0.0, 0.5) } else { hsla(0.0, 0.0, 0.0, 0.3) };
+        let card_bg = if is_dark { hsla(0.0, 0.0, 0.15, 1.0) } else { hsla(0.0, 0.0, 1.0, 1.0) };
+
+        let mut results_div = div().id("search-results-list").flex().flex_col()
+            .max_h(px(400.)).overflow_y_scroll();
+
+        if !self.search_query.is_empty() && self.search_results.is_empty() {
+            results_div = results_div.child(
+                div().px(px(20.)).py(px(16.)).text_size(px(13.)).text_color(muted.opacity(0.6))
+                    .child(format!("No results for \"{}\"", self.search_query))
+            );
+        }
+
+        for (i, result) in self.search_results.iter().enumerate() {
+            let file_name = result.chunk.file_path.file_stem()
+                .and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let heading = result.chunk.heading.clone();
+            // Build preview: show content with query context
+            let preview: String = result.chunk.content.chars().take(150).collect();
+            let rel_path = result.chunk.file_path.file_name()
+                .and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let path = result.chunk.file_path.clone();
+            let score = result.score;
+
+            results_div = results_div.child(
+                div().id(ElementId::NamedInteger("sresult".into(), i as u64))
+                    .flex().flex_col().gap(px(2.))
+                    .px(px(16.)).py(px(8.))
+                    .border_b_1().border_color(border.opacity(0.2))
+                    .cursor_pointer()
+                    .hover(move |s: gpui::StyleRefinement| s.bg(accent.opacity(0.08)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.search_visible = false;
+                        this.side_panel = SidePanel::Files;
+                        this.open_path_as_tab(path.clone(), cx, false);
+                    }))
+                    // Row 1: file name + score
+                    .child(
+                        div().flex().flex_row().items_center().justify_between()
+                            .child(div().flex().flex_row().items_center().gap(px(8.))
+                                .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).child(file_name))
+                                .child(div().text_size(px(11.)).text_color(accent.opacity(0.7)).child(heading))
+                            )
+                            .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
+                                .child(format!("{:.0}%", score * 100.0)))
+                    )
+                    // Row 2: content preview
+                    .child(div().text_size(px(12.)).text_color(muted.opacity(0.8))
+                        .overflow_hidden().whitespace_nowrap().text_ellipsis()
+                        .child(preview))
+                    // Row 3: file path
+                    .child(div().text_size(px(10.)).text_color(muted.opacity(0.4)).child(rel_path))
+            );
+        }
+
+        let has_vectors = self.vault_search.as_ref().map_or(false, |s| s.vectors_available());
+        let chunk_count = self.vault_search.as_ref().map_or(0, |s| s.chunk_count());
+
+        Some(
+            // Full-screen overlay backdrop
+            div().id("search-overlay").absolute().top(px(0.)).left(px(0.)).size_full()
+                .bg(overlay_bg)
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    // Click backdrop to close
+                    this.search_visible = false;
+                    cx.notify();
+                }))
+                .flex().justify_center().pt(px(80.))
+                .child(
+                    // Modal card (stop click propagation by having its own mouse handler)
+                    div().id("search-modal-card")
+                        .w(px(650.)).max_h(px(520.))
+                        .bg(card_bg)
+                        .rounded(px(12.))
+                        .border_1().border_color(border.opacity(0.4))
+                        .shadow_lg()
+                        .flex().flex_col()
+                        .on_mouse_down(MouseButton::Left, |_, _, _| { /* stop propagation */ })
+                        // Input row
+                        .child(
+                            div().flex().flex_row().items_center()
+                                .px(px(16.)).py(px(12.))
+                                .border_b_1().border_color(border.opacity(0.3))
+                                .child(
+                                    div().text_size(px(14.)).text_color(muted.opacity(0.5)).pr(px(8.)).child("\u{1F50D}")
+                                )
+                                .child(
+                                    div().flex_1().child(
+                                        Input::new(&self.search_input).appearance(false).bordered(false)
+                                    )
+                                )
+                        )
+                        // Results
+                        .child(results_div)
+                        // Footer
+                        .child(
+                            div().flex().items_center().justify_between()
+                                .px(px(16.)).py(px(6.))
+                                .border_t_1().border_color(border.opacity(0.2))
+                                .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
+                                    .child(format!("{} chunks indexed{}", chunk_count, if has_vectors { " · semantic" } else { "" })))
+                                .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
+                                    .child("esc to close"))
+                        )
+                )
+                .into_any_element()
+        )
     }
 
     fn render_file_tree(&self, entries: &[FileTreeEntry], depth: usize, out: &mut Vec<AnyElement>, cx: &mut Context<Self>) {
@@ -1644,7 +1818,7 @@ impl Render for ForgeApp {
             }
         }
 
-        div().flex().flex_col().size_full().bg(bg).text_color(fg)
+        div().flex().flex_col().size_full().bg(bg).text_color(fg).relative()
             .key_context("ForgeApp").track_focus(&self.focus_handle(cx))
             // Global scrollbar drag handlers -- keep tracking even if the mouse
             // drifts outside the 12px-wide scrollbar column during a drag.
@@ -1693,6 +1867,7 @@ impl Render for ForgeApp {
             .on_action(cx.listener(Self::show_files))
             .on_action(cx.listener(Self::show_graph))
             .on_action(cx.listener(Self::show_settings))
+            .on_action(cx.listener(Self::show_search))
             .on_action(cx.listener(Self::nav_back))
             .on_action(cx.listener(Self::nav_forward))
             .on_action(cx.listener(Self::ctx_open))
@@ -1731,6 +1906,7 @@ impl Render for ForgeApp {
             .on_action(cx.listener(Self::fwd_zoom_out))
             .on_action(cx.listener(Self::fwd_zoom_reset))
             .child(main_row).child(sbar)
+            .children(self.render_search_modal(cx))
     }
 }
 
@@ -1763,6 +1939,8 @@ pub fn run_app() {
             KeyBinding::new("ctrl-shift-r", ToggleReadableWidth, Some("Editor")),
             KeyBinding::new("ctrl-shift-b", ToggleBacklinks, Some("ForgeApp")),
             KeyBinding::new("ctrl-shift-b", ToggleBacklinks, Some("Editor")),
+            KeyBinding::new("ctrl-shift-f", ShowSearch, Some("ForgeApp")),
+            KeyBinding::new("ctrl-shift-f", ShowSearch, Some("Editor")),
             // Navigation (back / forward across file history)
             KeyBinding::new("alt-left", NavBack, Some("ForgeApp")),
             KeyBinding::new("alt-left", NavBack, Some("Editor")),

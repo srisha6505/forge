@@ -7,6 +7,7 @@ mod graph;
 mod icons;
 mod links;
 mod markdown;
+mod search;
 mod settings;
 mod theme;
 
