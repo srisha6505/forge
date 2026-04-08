@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Forge
+Comment=GPU-accelerated markdown editor with local AI
+Exec=forge
+Icon=forge
+Type=Application
+Categories=Office;TextEditor;
+MimeType=text/markdown;text/plain;
+Terminal=false
