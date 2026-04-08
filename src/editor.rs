@@ -81,9 +81,9 @@ pub struct AutocompleteState {
 pub struct Editor {
     focus_handle: FocusHandle,
     pub buffer: Buffer,
-    scroll_offset: f32,
+    pub scroll_offset: f32,
     /// Target scroll position the editor is animating toward.
-    scroll_target: f32,
+    pub scroll_target: f32,
     viewport_height: f32,
     is_selecting: bool,
     cursor_visible: bool,
@@ -129,6 +129,12 @@ pub struct Editor {
     pub mono_font_family: SharedString,
     /// Body font size from settings (before zoom).
     pub base_font_size: f32,
+    /// Deferred scroll: set from search result open. Processed in prepaint
+    /// after line heights are computed so scroll position is accurate.
+    pub pending_scroll_byte: Option<usize>,
+    /// Temporary highlight of a byte range (start, end, time set).
+    /// Fades after 1.5 seconds. Used to flash search result chunks.
+    pub highlight_range: Option<(usize, usize, std::time::Instant)>,
     /// Vault root, used to resolve image embed paths.
     pub vault_root: Option<PathBuf>,
     /// Cache of decoded images keyed by the embed target string.
@@ -278,6 +284,8 @@ impl Editor {
             body_font_family: "DejaVu Sans".into(),
             mono_font_family: "DejaVu Sans Mono".into(),
             base_font_size: 15.0,
+            pending_scroll_byte: None,
+            highlight_range: None,
         }
     }
 
@@ -657,7 +665,7 @@ impl Editor {
         true
     }
 
-    fn ensure_cursor_visible(&mut self) {
+    pub fn ensure_cursor_visible(&mut self) {
         let (line, _) = self.buffer.cursor_line_col();
         let cursor_y = self.line_y(line);
         let cursor_h = self.line_heights.get(line).copied().unwrap_or(self.line_h());
@@ -1244,10 +1252,8 @@ fn build_display_line(
         Some(BlockType::Heading(_)) => (15.0 * zoom, true),
         _ => (15.0 * zoom, false),
     };
-    let is_code_block = matches!(
-        info.map(|i| i.block.block_type),
-        Some(BlockType::CodeBlock) | Some(BlockType::MathBlock)
-    );
+    let is_code_block = matches!(info.map(|i| i.block.block_type), Some(BlockType::CodeBlock));
+    let is_math_block = matches!(info.map(|i| i.block.block_type), Some(BlockType::MathBlock));
     let is_table = matches!(info.map(|i| i.block.block_type), Some(BlockType::Table));
     let is_image_embed = matches!(info.map(|i| i.block.block_type), Some(BlockType::ImageEmbed));
 
@@ -1281,6 +1287,62 @@ fn build_display_line(
             runs,
             display_to_content,
             font_size: fs,
+        };
+    }
+
+    // Math block: convert LaTeX to Unicode, render with italic styling.
+    if is_math_block && !show_raw {
+        let trimmed = line.trim();
+        if trimmed == "$$" {
+            // $$ fence line: render as thin blank spacer
+            return DisplayLine {
+                display_text: " ".into(),
+                runs: vec![TextRun {
+                    len: 1, font: base_font.clone(), color: muted.opacity(0.3),
+                    background_color: Some(code_bg), underline: None, strikethrough: None,
+                }],
+                display_to_content: vec![0, 0],
+                font_size: font_size * 0.5,
+            };
+        }
+        let converted = latex_to_unicode(trimmed);
+        let math_font = Font {
+            family: base_font.family.clone(),
+            features: FontFeatures::default(),
+            fallbacks: base_font.fallbacks.clone(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Italic,
+        };
+        let runs = vec![TextRun {
+            len: converted.len(),
+            font: math_font,
+            color: fg,
+            background_color: Some(code_bg),
+            underline: None,
+            strikethrough: None,
+        }];
+        let d2c: Vec<usize> = (0..=converted.len()).map(|_| 0).collect();
+        return DisplayLine {
+            display_text: format!("  {}  ", converted),
+            runs: {
+                let padded_len = converted.len() + 4;
+                vec![TextRun {
+                    len: padded_len,
+                    font: Font {
+                        family: base_font.family.clone(),
+                        features: FontFeatures::default(),
+                        fallbacks: base_font.fallbacks.clone(),
+                        weight: FontWeight::NORMAL,
+                        style: FontStyle::Italic,
+                    },
+                    color: fg,
+                    background_color: Some(code_bg),
+                    underline: None,
+                    strikethrough: None,
+                }]
+            },
+            display_to_content: (0..=converted.len() + 4).map(|_| 0).collect(),
+            font_size,
         };
     }
 
@@ -1452,6 +1514,19 @@ fn build_display_line(
         }
     }
     display_to_content.push(line.len());
+
+    // Post-process: convert LaTeX commands to Unicode in lines with inline math.
+    // The $ delimiters are already stripped; now convert the content.
+    let has_math = info.map(|i| i.spans.iter().any(|s| s.style == SpanStyle::Math)).unwrap_or(false);
+    if has_math {
+        let converted = latex_to_unicode(&display_text);
+        if converted.len() != display_text.len() {
+            // Length changed -- rebuild d2c mapping (approximate: all map to 0)
+            display_to_content = (0..=converted.len()).map(|_| 0).collect();
+            if let Some(last) = display_to_content.last_mut() { *last = line.len(); }
+        }
+        display_text = converted;
+    }
 
     // 3. Build runs for display_text
     let mut runs = build_text_runs_display(&display_text, &display_to_content, info, base_font, fg, muted, code_bg, link_color, heading_bold, is_code_block);
@@ -1813,6 +1888,7 @@ fn build_text_runs_inner(
                     SpanStyle::InlineCode => is_code = true,
                     SpanStyle::Strikethrough => is_strike = true,
                     SpanStyle::Link => is_link = true,
+                    SpanStyle::Math => is_italic = true, // render inline math as italic
                 }
             }
         }
@@ -2352,6 +2428,13 @@ impl Element for EditorElement {
                 ed.reparse();
             }
             ed.preload_image_embeds();
+            // Handle deferred scroll (from search result open). Must run after
+            // reparse so cumulative_heights are valid.
+            if let Some(byte) = ed.pending_scroll_byte.take() {
+                ed.buffer.set_cursor(byte);
+                ed.rebuild_cumulative_heights();
+                ed.ensure_cursor_visible();
+            }
             ed.tick_scroll_animation()
         });
         if need_anim_frame { window.request_animation_frame(); }
@@ -2730,6 +2813,40 @@ impl Element for EditorElement {
             ));
         }
 
+        // Paint search result highlight (temporary flash)
+        {
+            let editor = self.editor.read(cx);
+            if let Some((hl_start, hl_end, hl_time)) = editor.highlight_range {
+                let elapsed = hl_time.elapsed().as_secs_f32();
+                if elapsed < 1.8 {
+                    // Fade: full opacity for 1s, then fade over 0.8s
+                    let alpha = if elapsed < 1.0 { 0.18 } else { 0.18 * (1.0 - (elapsed - 1.0) / 0.8) };
+                    let hl_color = hsla(55.0 / 360.0, 0.9, 0.55, alpha);
+                    // Find which lines this byte range covers
+                    let start_line = editor.buffer.byte_to_line(hl_start);
+                    let end_line = editor.buffer.byte_to_line(hl_end.min(editor.buffer.len_bytes()));
+                    for line in start_line..=end_line {
+                        let y = editor.line_y(line) - editor.scroll_offset;
+                        let h = editor.line_heights.get(line).copied().unwrap_or(editor.line_h());
+                        if y + h < 0.0 || y > bounds.size.height.into() { continue; }
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.left(), bounds.top() + px(y)),
+                                size(bounds.size.width, px(h)),
+                            ),
+                            hl_color,
+                        ));
+                    }
+                    // Request another frame to keep the fade animation going
+                    window.request_animation_frame();
+                } else {
+                    // Expired -- clear it on next update
+                    let entity = self.editor.clone();
+                    entity.update(cx, |ed, _| { ed.highlight_range = None; });
+                }
+            }
+        }
+
         // Paint selections
         for sel in &state.selections {
             window.paint_quad(sel.clone());
@@ -2995,6 +3112,215 @@ impl Render for Editor {
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
+
+// ── LaTeX to Unicode conversion ──
+
+/// Convert common LaTeX math commands to Unicode approximations.
+/// Not a full LaTeX renderer, but makes formulas readable.
+fn latex_to_unicode(text: &str) -> String {
+    let mut s = text.to_string();
+    // Strip $$ delimiters if present
+    s = s.trim().trim_start_matches("$$").trim_end_matches("$$").trim().to_string();
+
+    // \text{...} → plain text (process innermost first)
+    for _ in 0..10 {
+        if let Some(start) = s.find("\\text{") {
+            if let Some(end) = s[start + 6..].find('}') {
+                let inner = s[start + 6..start + 6 + end].to_string();
+                s = format!("{}{}{}", &s[..start], inner, &s[start + 7 + end..]);
+                continue;
+            }
+        }
+        break;
+    }
+
+    // \frac{a}{b} → (a)/(b)
+    for _ in 0..20 {
+        if let Some(start) = s.find("\\frac{") {
+            let after_frac = &s[start + 6..];
+            if let Some(close1) = find_brace_end(after_frac) {
+                let num = after_frac[..close1].to_string();
+                let rest = &after_frac[close1 + 1..];
+                if rest.starts_with('{') {
+                    if let Some(close2) = find_brace_end(&rest[1..]) {
+                        let den = rest[1..1 + close2].to_string();
+                        let tail = &rest[2 + close2..];
+                        s = format!("{}({})/({}){}", &s[..start], num, den, tail);
+                        continue;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    // Symbol replacements (order matters: longer patterns first)
+    let replacements = [
+        ("\\rightarrow", "→"), ("\\leftarrow", "←"),
+        ("\\Rightarrow", "⇒"), ("\\Leftarrow", "⇐"),
+        ("\\leftrightarrow", "↔"),
+        ("\\approx", "≈"), ("\\times", "×"), ("\\cdot", "·"),
+        ("\\leq", "≤"), ("\\geq", "≥"), ("\\neq", "≠"),
+        ("\\pm", "±"), ("\\mp", "∓"),
+        ("\\infty", "∞"), ("\\sum", "Σ"), ("\\prod", "Π"),
+        ("\\int", "∫"), ("\\sqrt", "√"),
+        ("\\alpha", "α"), ("\\beta", "β"), ("\\gamma", "γ"),
+        ("\\delta", "δ"), ("\\Delta", "Δ"),
+        ("\\epsilon", "ε"), ("\\theta", "θ"), ("\\Theta", "Θ"),
+        ("\\lambda", "λ"), ("\\Lambda", "Λ"),
+        ("\\mu", "μ"), ("\\nu", "ν"),
+        ("\\pi", "π"), ("\\Pi", "Π"),
+        ("\\rho", "ρ"), ("\\sigma", "σ"), ("\\Sigma", "Σ"),
+        ("\\tau", "τ"), ("\\phi", "φ"), ("\\Phi", "Φ"),
+        ("\\omega", "ω"), ("\\Omega", "Ω"),
+        ("\\in", "∈"), ("\\notin", "∉"),
+        ("\\subset", "⊂"), ("\\supset", "⊃"),
+        ("\\subseteq", "⊆"), ("\\supseteq", "⊇"),
+        ("\\cup", "∪"), ("\\cap", "∩"),
+        ("\\forall", "∀"), ("\\exists", "∃"),
+        ("\\partial", "∂"), ("\\nabla", "∇"),
+        ("\\ldots", "…"), ("\\dots", "…"), ("\\cdots", "⋯"),
+        ("\\quad", "  "), ("\\qquad", "    "),
+        ("\\,", " "), ("\\;", " "), ("\\!", ""),
+        ("\\left(", "("), ("\\right)", ")"),
+        ("\\left[", "["), ("\\right]", "]"),
+        ("\\left\\{", "{"), ("\\right\\}", "}"),
+        ("\\left|", "|"), ("\\right|", "|"),
+        ("\\left", ""), ("\\right", ""),
+        ("\\langle", "\u{27E8}"), ("\\rangle", "\u{27E9}"),
+        ("\\lvert", "|"), ("\\rvert", "|"),
+        ("\\lVert", "\u{2016}"), ("\\rVert", "\u{2016}"),
+        ("\\lceil", "\u{2308}"), ("\\rceil", "\u{2309}"),
+        ("\\lfloor", "\u{230A}"), ("\\rfloor", "\u{230B}"),
+        ("\\mid", " | "),
+        ("\\parallel", "\u{2225}"),
+        ("\\equiv", "\u{2261}"),
+        ("\\sim", "~"), ("\\simeq", "\u{2243}"),
+        ("\\propto", "\u{221D}"),
+        ("\\gg", "\u{226B}"), ("\\ll", "\u{226A}"),
+        ("\\to", "→"), ("\\mapsto", "\u{21A6}"),
+        ("\\implies", " \u{27F9} "), ("\\impliedby", " \u{27F8} "),
+        ("\\oplus", "\u{2295}"), ("\\otimes", "\u{2297}"),
+        ("\\odot", "\u{2299}"),
+        ("\\dagger", "\u{2020}"),
+        ("\\emptyset", "\u{2205}"),
+        ("\\setminus", "\u{2216}"),
+        ("\\neg", "\u{00AC}"),
+        ("\\land", "\u{2227}"), ("\\lor", "\u{2228}"),
+        ("\\{", "{"), ("\\}", "}"),
+        ("\\_", "_"),
+        ("\\#", "#"), ("\\%", "%"), ("\\&", "&"),
+        ("\\\\", " "),
+    ];
+    for (from, to) in &replacements {
+        s = s.replace(from, to);
+    }
+
+    // Clean up: remove remaining single backslash commands we don't know
+    // but keep the content. E.g. \mathrm{x} → x
+    for _ in 0..10 {
+        if let Some(idx) = s.find('\\') {
+            // Find end of command name
+            let cmd_end = s[idx + 1..].find(|c: char| !c.is_ascii_alphabetic())
+                .map(|i| idx + 1 + i).unwrap_or(s.len());
+            if cmd_end > idx + 1 {
+                let after_cmd = &s[cmd_end..];
+                if after_cmd.starts_with('{') {
+                    if let Some(close) = find_brace_end(&after_cmd[1..]) {
+                        let inner = &after_cmd[1..1 + close];
+                        s = format!("{}{}{}", &s[..idx], inner, &after_cmd[2 + close..]);
+                        continue;
+                    }
+                }
+                // Command without braces: just remove the command
+                s = format!("{}{}", &s[..idx], &s[cmd_end..]);
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Convert subscript digits: _{0} → ₀, _{12} → ₁₂, _x → ₓ (single char)
+    // and superscript digits: ^{2} → ², ^{n} → ⁿ
+    let sub_digits = ['₀','₁','₂','₃','₄','₅','₆','₇','₈','₉'];
+    let sup_digits = ['⁰','¹','²','³','⁴','⁵','⁶','⁷','⁸','⁹'];
+
+    // Handle _{...} subscripts
+    while let Some(idx) = s.find("_{") {
+        if let Some(close) = s[idx+2..].find('}') {
+            let inner = &s[idx+2..idx+2+close];
+            let converted: String = inner.chars().map(|c| {
+                if c.is_ascii_digit() { sub_digits[(c as u8 - b'0') as usize] }
+                else { c }
+            }).collect();
+            s = format!("{}{}{}", &s[..idx], converted, &s[idx+3+close..]);
+        } else { break; }
+    }
+    // Single char subscript: _x (not followed by {)
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    result.push(sub_digits[(next as u8 - b'0') as usize]);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+    }
+    s = result;
+
+    // Handle ^{...} superscripts
+    while let Some(idx) = s.find("^{") {
+        if let Some(close) = s[idx+2..].find('}') {
+            let inner = &s[idx+2..idx+2+close];
+            let converted: String = inner.chars().map(|c| {
+                if c.is_ascii_digit() { sup_digits[(c as u8 - b'0') as usize] }
+                else if c == 'n' { '\u{207F}' }
+                else if c == '-' { '\u{207B}' }
+                else if c == '+' { '\u{207A}' }
+                else if c == '(' { '\u{207D}' }
+                else if c == ')' { '\u{207E}' }
+                else { c }
+            }).collect();
+            s = format!("{}{}{}", &s[..idx], converted, &s[idx+3+close..]);
+        } else { break; }
+    }
+    // Single char superscript: ^2, ^n
+    let mut result2 = String::new();
+    let mut chars2 = s.chars().peekable();
+    while let Some(c) = chars2.next() {
+        if c == '^' {
+            if let Some(&next) = chars2.peek() {
+                if next.is_ascii_digit() {
+                    result2.push(sup_digits[(next as u8 - b'0') as usize]);
+                    chars2.next();
+                    continue;
+                }
+            }
+        }
+        result2.push(c);
+    }
+    s = result2;
+
+    s.trim().to_string()
+}
+
+/// Find the position of the matching closing brace for text starting AFTER an opening '{'.
+fn find_brace_end(s: &str) -> Option<usize> {
+    let mut depth = 1;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => { depth -= 1; if depth == 0 { return Some(i); } }
+            _ => {}
+        }
+    }
+    None
+}
 
 // ── Image loading helpers ──
 

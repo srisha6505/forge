@@ -44,6 +44,8 @@ pub enum SpanStyle {
     InlineCode,
     Strikethrough,
     Link,
+    /// Inline math: `$...$`
+    Math,
 }
 
 /// An inline span within a line (byte range is relative to line start).
@@ -212,12 +214,11 @@ pub fn parse_lines(text: &str, line_starts: &[usize]) -> Vec<LineInfo> {
         }
     }
 
-    // Second pass: scan each non-code-block line for wikilinks.
+    // Second pass: scan each non-code/math line for wikilinks + inline math.
     for (i, info) in lines.iter_mut().enumerate() {
         if matches!(info.block.block_type, BlockType::CodeBlock | BlockType::MathBlock | BlockType::ImageEmbed) { continue; }
         let line_text = line_str(text, line_starts, i);
         let found = scan_wikilinks(line_text);
-        // Filter out wikilinks whose range overlaps with an InlineCode span on this line.
         info.wikilinks = found.into_iter().filter(|w| {
             !info.spans.iter().any(|s| {
                 s.style == SpanStyle::InlineCode
@@ -225,6 +226,29 @@ pub fn parse_lines(text: &str, line_starts: &[usize]) -> Vec<LineInfo> {
                     && w.range.start < s.range.end
             })
         }).collect();
+        // Scan for inline math $...$  (single dollar, not $$)
+        let bytes = line_text.as_bytes();
+        let mut j = 0;
+        while j < bytes.len() {
+            if bytes[j] == b'$' && (j + 1 >= bytes.len() || bytes[j + 1] != b'$') {
+                let start = j;
+                j += 1;
+                while j < bytes.len() && bytes[j] != b'$' { j += 1; }
+                if j < bytes.len() && j > start + 1 {
+                    // Don't add if overlapping with InlineCode span
+                    let range = start..j + 1;
+                    let overlaps_code = info.spans.iter().any(|s| {
+                        s.style == SpanStyle::InlineCode && s.range.start < range.end && range.start < s.range.end
+                    });
+                    if !overlaps_code {
+                        info.spans.push(InlineSpan { range, style: SpanStyle::Math });
+                    }
+                    j += 1;
+                }
+            } else {
+                j += 1;
+            }
+        }
     }
 
     lines
@@ -458,6 +482,7 @@ pub fn marker_lens(style: SpanStyle) -> (usize, usize) {
         SpanStyle::InlineCode => (1, 1),     // `text`
         SpanStyle::Strikethrough => (2, 2),  // ~~text~~
         SpanStyle::Link => (0, 0),           // keep [text](url) as-is for now
+        SpanStyle::Math => (1, 1),           // $text$
     }
 }
 

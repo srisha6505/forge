@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::UNIX_EPOCH;
 use std::collections::HashMap;
-use serde_json;
+
+use crate::embedder::LocalEmbedder;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -22,56 +23,10 @@ pub struct SearchResult {
     pub score: f32,
 }
 
-pub struct Embedder {
-    url: String,
-    model: String,
-}
-
-impl Embedder {
-    pub fn new(url: &str, model: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            model: model.to_string(),
-        }
-    }
-
-    /// Embed a single text. Returns a vector of f32 values.
-    /// Calls POST {url}/api/embeddings with JSON body:
-    /// { "model": model, "prompt": text }
-    /// Response is: { "embedding": [f32, ...] }
-    /// Returns None if Ollama isn't running or the model isn't pulled.
-    pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        let resp = ureq::post(&format!("{}/api/embeddings", self.url))
-            .set("Content-Type", "application/json")
-            .send_json(ureq::json!({
-                "model": &self.model,
-                "prompt": text
-            }));
-        match resp {
-            Ok(r) => {
-                let body: serde_json::Value = r.into_json().ok()?;
-                let arr = body["embedding"].as_array()?;
-                Some(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Embed multiple texts. Returns Vec of Option<Vec<f32>>. Skips failures.
-    pub fn embed_batch(&self, texts: &[&str]) -> Vec<Option<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
-    }
-
-    /// Check if Ollama is reachable and the model is available.
-    pub fn is_available(&self) -> bool {
-        self.embed("test").is_some()
-    }
-}
-
 pub struct VaultSearch {
     db: rusqlite::Connection,
     hnsw: usearch::Index,
-    embedder: Embedder,
+    embedder: Option<LocalEmbedder>,
     next_id: u64,
     vectors_enabled: bool,
     index_path: PathBuf,
@@ -108,8 +63,18 @@ impl VaultSearch {
             hnsw.load(index_path.to_str().ok_or("invalid index path")?)?;
         }
 
-        let embedder = Embedder::new("http://localhost:11434", "nomic-embed-text");
-        let vectors_enabled = embedder.is_available();
+        // Try to load the local embedding model. If it fails (e.g. first run,
+        // model download fails), fall back to BM25-only.
+        let (embedder, vectors_enabled) = match LocalEmbedder::new() {
+            Ok(e) => {
+                eprintln!("[forge] Embedding model loaded (384 dims)");
+                (Some(e), true)
+            }
+            Err(e) => {
+                eprintln!("[forge] Embedding model failed: {}. BM25 only.", e);
+                (None, false)
+            }
+        };
 
         let next_id: u64 = db.query_row(
             "SELECT COALESCE(MAX(id), 0) FROM chunks",
@@ -195,7 +160,7 @@ impl VaultSearch {
             )?;
 
             if self.vectors_enabled {
-                if let Some(vector) = self.embedder.embed(&chunk_text) {
+                if let Some(vector) = self.embedder.as_ref().and_then(|e| e.embed(&chunk_text).ok()) {
                     if self.hnsw.capacity() < self.hnsw.size() + 1 {
                         self.hnsw.reserve(self.hnsw.capacity().max(64) * 2)?;
                     }
@@ -232,12 +197,19 @@ impl VaultSearch {
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
         let limit = (k * 2) as i64;
 
-        // Build FTS5 query: add * suffix to each word for prefix matching,
-        // so "transpor" matches "transport". Use porter stemming too.
-        let fts_query: String = query.split_whitespace()
+        // Build FTS5 query.
+        // Starts with " → BM25-only mode (prefix matching, no vectors).
+        // Otherwise → hybrid (prefix BM25 + vector search).
+        let trimmed = query.trim();
+        let bm25_only = trimmed.starts_with('"');
+        let search_text = if bm25_only {
+            trimmed.trim_matches('"').trim()
+        } else {
+            trimmed
+        };
+        let fts_query: String = search_text.split_whitespace()
             .filter(|w| !w.is_empty())
             .map(|w| {
-                // Strip non-alphanumeric for safety, add * for prefix
                 let clean: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
                 if clean.is_empty() { String::new() } else { format!("{}*", clean) }
             })
@@ -287,7 +259,7 @@ impl VaultSearch {
             }
         }
 
-        if !self.vectors_enabled {
+        if !self.vectors_enabled || bm25_only {
             let mut scored: Vec<(u64, f32)> = bm25_map
                 .iter()
                 .map(|(&id, (score, _))| (id, *score))
@@ -308,7 +280,7 @@ impl VaultSearch {
             return Ok(results);
         }
 
-        let query_vector = match self.embedder.embed(query) {
+        let query_vector = match self.embedder.as_ref().and_then(|e| e.embed(query).ok()) {
             Some(v) => v,
             None => {
                 // Ollama went away mid-session; fall back to BM25 only
@@ -344,12 +316,14 @@ impl VaultSearch {
 
         let mut final_scores: HashMap<u64, f32> = HashMap::new();
 
+        // BM25 gets higher weight -- it's more precise for keyword queries.
+        // Vectors help for semantic/fuzzy matches but shouldn't override exact hits.
         for (&id, (bm25_score, _)) in &bm25_map {
-            *final_scores.entry(id).or_insert(0.0) += 0.4 * bm25_score;
+            *final_scores.entry(id).or_insert(0.0) += 0.7 * bm25_score;
         }
 
         for (&id, &vec_score) in &vector_map {
-            *final_scores.entry(id).or_insert(0.0) += 0.6 * vec_score;
+            *final_scores.entry(id).or_insert(0.0) += 0.3 * vec_score;
         }
 
         let vec_ids_needing_lookup: Vec<u64> = vector_map.keys()
