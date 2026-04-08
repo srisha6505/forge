@@ -209,21 +209,48 @@ impl ChatPanel {
         let inference = inference.clone();
         let messages = session.llm_messages.clone();
         let tools = agent::tool_schemas();
-        let vault_path = self.vault_path.clone().unwrap_or_default();
-        let db_path = self.db_path.clone().unwrap_or_default();
+        let vault_path = match &self.vault_path {
+            Some(p) if p.is_dir() => p.clone(),
+            _ => {
+                if let Some(s) = self.sessions.get_mut(self.active_session) {
+                    s.busy = false;
+                    s.ui_messages.pop();
+                    s.ui_messages.push(UiMessage::Error {
+                        message: "No vault open. Press Ctrl+O to open a vault first.".into(),
+                    });
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let db_path = self.db_path.clone().unwrap_or_else(|| {
+            dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
+                .join("forge").join("forge.db")
+        });
         let max_iters = self.max_tool_iterations;
 
         let (event_tx, event_rx) = mpsc::channel();
         self.event_rx = Some(event_rx);
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("forge-agent".into())
             .spawn(move || {
                 let ctx = ToolContext { vault_path, db_path };
                 let mut msgs = messages;
                 agent::run_agent_loop(&inference, &mut msgs, &tools, &ctx, max_iters, &event_tx);
             })
-            .ok();
+        {
+            eprintln!("[forge] Failed to spawn agent thread: {e}");
+            if let Some(s) = self.sessions.get_mut(self.active_session) {
+                s.busy = false;
+                s.ui_messages.pop();
+                s.ui_messages.push(UiMessage::Error {
+                    message: format!("Failed to start agent: {e}"),
+                });
+            }
+            cx.notify();
+            return;
+        }
 
         self.start_event_poll(cx);
         cx.notify();

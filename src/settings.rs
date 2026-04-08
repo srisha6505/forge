@@ -117,18 +117,8 @@ impl Settings {
         }
     }
 
-    /// Default fallback vault path for testing.
-    pub fn default_test_vault() -> PathBuf {
-        PathBuf::from("/home/code/Production/sfa/research")
-    }
-
     pub fn resolved_vault_path(&self) -> Option<PathBuf> {
-        self.last_vault_path.clone()
-            .filter(|p| p.is_dir())
-            .or_else(|| {
-                let fallback = Self::default_test_vault();
-                if fallback.is_dir() { Some(fallback) } else { None }
-            })
+        self.last_vault_path.clone().filter(|p| p.is_dir())
     }
 
     pub fn set_vault(&mut self, path: &Path) {
