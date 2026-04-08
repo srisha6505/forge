@@ -198,3 +198,19 @@ pub fn rail_search_icon(color: Hsla) -> Div {
         .child(div().absolute().bottom(px(2.)).right(px(2.))
             .w(px(6.)).h(px(2.)).bg(color).rounded(px(1.)))
 }
+
+/// Speech bubble icon for the chat rail button.
+pub fn rail_chat_icon(color: Hsla) -> Div {
+    div()
+        .flex_shrink_0().relative()
+        .w(px(RAIL_ICON_SIZE)).h(px(RAIL_ICON_SIZE))
+        // Bubble body
+        .child(div().absolute().top(px(1.)).left(px(1.))
+            .w(px(14.)).h(px(10.))
+            .rounded(px(3.))
+            .border_2().border_color(color))
+        // Tail
+        .child(div().absolute().bottom(px(1.)).left(px(4.))
+            .w(px(4.)).h(px(4.))
+            .bg(color))
+}

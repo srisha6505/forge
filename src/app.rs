@@ -11,15 +11,18 @@ use gpui_component::menu::ContextMenuExt;
 use gpui_component::theme::{Theme as GTheme, ThemeMode as GThemeMode};
 use gpui_component::ActiveTheme;
 
+use crate::agent;
+use crate::chat::{ChatPanel, ChatPanelEvent};
 use crate::editor::{self, Editor, EditorEvent, VaultFile};
 use crate::graph::{GraphEvent, GraphView};
 use crate::icons;
 use crate::links::LinkIndex;
+use crate::llm;
 use crate::search::VaultSearch;
 use crate::settings::Settings;
 use crate::theme as t;
 
-actions!(forge, [OpenFolder, Save, Quit, ToggleTheme, ToggleSidebar, NewFile, DeleteFile, CloseTab, NextTab, PrevTab, RefreshVault, ToggleReadableWidth, ToggleBacklinks, ShowFiles, ShowGraph, ShowSettings, ShowSearch, NavBack, NavForward, CtxOpen, CtxOpenNewTab, CtxRename, CtxDelete, CtxCopyPath, CtxReveal, CtxDuplicate, CtxNewFileHere, CtxNewFolderHere, CtxFolderRename, CtxFolderDelete]);
+actions!(forge, [OpenFolder, Save, Quit, ToggleTheme, ToggleSidebar, NewFile, DeleteFile, CloseTab, NextTab, PrevTab, RefreshVault, ToggleReadableWidth, ToggleBacklinks, ShowFiles, ShowGraph, ShowSettings, ShowSearch, SearchDown, SearchUp, SearchClose, NavBack, NavForward, ToggleChat, CtxOpen, CtxOpenNewTab, CtxRename, CtxDelete, CtxCopyPath, CtxReveal, CtxDuplicate, CtxNewFileHere, CtxNewFolderHere, CtxFolderRename, CtxFolderDelete]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidePanel {
@@ -107,6 +110,76 @@ fn reveal_in_file_manager(path: &Path) {
     }
 }
 
+/// Strip common markdown syntax characters for clean display text.
+fn strip_md_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '#' if out.is_empty() || out.ends_with('\n') => {
+                // Skip heading markers and trailing space
+                while chars.peek() == Some(&'#') { chars.next(); }
+                if chars.peek() == Some(&' ') { chars.next(); }
+            }
+            '*' | '_' => {
+                // Skip bold/italic markers (**, *, __, _)
+                while chars.peek() == Some(&c) { chars.next(); }
+            }
+            '~' => {
+                if chars.peek() == Some(&'~') { chars.next(); } // ~~strikethrough~~
+            }
+            '`' => {
+                // Skip backticks
+                while chars.peek() == Some(&'`') { chars.next(); }
+            }
+            '|' => out.push(' '), // Table pipes → space
+            '[' => {
+                // [[wikilink]] or [text](url) → just show the text
+                out.push(c);
+            }
+            '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Split text into (substring, is_match) spans. Case-insensitive substring
+/// match -- highlights every occurrence of every query word, anywhere in text.
+fn highlight_text(text: &str, query_words: &[String]) -> Vec<(String, bool)> {
+    if query_words.is_empty() || text.is_empty() {
+        return vec![(text.to_string(), false)];
+    }
+    let lower = text.to_lowercase();
+    let len = text.len();
+
+    // Mark which byte positions are part of a match.
+    let mut matched = vec![false; len];
+    for qw in query_words {
+        if qw.is_empty() { continue; }
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(qw.as_str()) {
+            let abs = start + pos;
+            for i in abs..abs + qw.len() {
+                if i < len { matched[i] = true; }
+            }
+            start = abs + 1;
+        }
+    }
+
+    // Build spans from the matched/unmatched runs.
+    let mut spans: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < len {
+        let is_match = matched[i];
+        let start = i;
+        while i < len && matched[i] == is_match { i += 1; }
+        spans.push((text[start..i].to_string(), is_match));
+    }
+    if spans.is_empty() { spans.push((text.to_string(), false)); }
+    spans
+}
+
 fn display_name(path: &Path) -> String {
     let n = path.file_name().unwrap_or_default().to_string_lossy();
     if n.ends_with(".md") { n[..n.len()-3].to_string() } else { n.to_string() }
@@ -158,10 +231,17 @@ pub struct ForgeApp {
     /// Whether settings have been modified since last save.
     settings_dirty: bool,
     vault_search: Option<VaultSearch>,
+    chat_panel: Entity<ChatPanel>,
+    chat_visible: bool,
+    chat_drag: Option<f32>,
     search_query: String,
     search_results: Vec<crate::search::SearchResult>,
     search_input: Entity<InputState>,
     search_visible: bool,
+    search_selected: usize,
+    search_scroll: ScrollHandle,
+    /// Set to true when editor needs focus restored (one-shot, cleared after use).
+    needs_refocus: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -204,30 +284,29 @@ impl ForgeApp {
 
         // Graph view entity
         let graph_view = cx.new(|cx| GraphView::new(cx));
-        // Search input
+
+        // Chat panel entity
+        let chat_panel = cx.new(|cx| ChatPanel::new(window, cx));
+        cx.subscribe(&chat_panel, |this: &mut Self, _, event: &ChatPanelEvent, cx| {
+            match event {
+                ChatPanelEvent::OpenFile(path) => {
+                    this.side_panel = SidePanel::Files;
+                    this.open_path_as_tab(path.clone(), cx, false);
+                }
+            }
+        }).detach();
+        // Search input (kept for compatibility but not used in search modal)
         let search_input = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe(&search_input, |this: &mut Self, _, event: &InputEvent, cx| {
             match event {
                 InputEvent::Change => {
                     this.search_query = this.search_input.read(cx).value().to_string();
-                    // Execute search
-                    if let Some(vs) = &this.vault_search {
-                        if !this.search_query.trim().is_empty() {
-                            this.search_results = vs.search(&this.search_query, 20).unwrap_or_default();
-                        } else {
-                            this.search_results.clear();
-                        }
-                    }
+                    this.run_search();
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => {
-                    // Open the first result if available
-                    if let Some(first) = this.search_results.first() {
-                        let path = first.chunk.file_path.clone();
-                        this.search_visible = false;
-                        this.side_panel = SidePanel::Files;
-                        this.open_path_as_tab(path, cx, false);
-                    }
+                    let idx = this.search_selected;
+                    this.open_search_result(idx, cx);
                 }
                 _ => {}
             }
@@ -266,17 +345,32 @@ impl ForgeApp {
             font_dropdown: None,
             settings_dirty: false,
             vault_search: None,
+            chat_panel,
+            chat_visible: false,
+            chat_drag: None,
             search_query: String::new(),
             search_results: Vec::new(),
             search_input,
             search_visible: false,
+            search_selected: 0,
+            search_scroll: ScrollHandle::new(),
+            needs_refocus: false,
         };
 
         // Auto-load last vault (or default test vault)
         if let Some(vp) = app.settings.resolved_vault_path() {
-            app.load_vault_sync(vp);
+            app.load_vault_sync(vp.clone());
             app.start_watcher(cx);
             app.push_vault_state_to_editor(cx);
+
+            // Pass vault info to chat panel.
+            let db_path = dirs::config_dir().unwrap_or_default().join("forge").join("forge.db");
+            let vault_name = vp.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            app.chat_panel.update(cx, |panel, _cx| {
+                panel.set_vault(vp.clone(), db_path);
+                panel.set_system_prompt(&agent::default_system_prompt(&vault_name));
+            });
+
             // Restore open tabs
             let tabs_to_open: Vec<PathBuf> = app.settings.open_tabs.iter()
                 .filter(|p| p.exists())
@@ -290,6 +384,7 @@ impl ForgeApp {
                 app.switch_to_tab(idx, cx);
             }
         }
+
         app
     }
 
@@ -329,6 +424,7 @@ impl ForgeApp {
             let _ = vs.build_vault(&path);
             self.vault_search = Some(vs);
         }
+
     }
 
     fn refresh_file_tree(&mut self) {
@@ -748,12 +844,97 @@ impl ForgeApp {
     fn show_settings(&mut self, _: &ShowSettings, _w: &mut Window, cx: &mut Context<Self>) {
         self.side_panel = SidePanel::Settings; cx.notify();
     }
+    fn search_down(&mut self, _: &SearchDown, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_visible || self.search_results.is_empty() { return; }
+        self.search_selected = (self.search_selected + 1).min(self.search_results.len() - 1);
+        cx.notify();
+    }
+    fn search_up(&mut self, _: &SearchUp, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_visible { return; }
+        self.search_selected = self.search_selected.saturating_sub(1);
+        cx.notify();
+    }
+    fn search_close(&mut self, _: &SearchClose, _: &mut Window, cx: &mut Context<Self>) {
+        self.search_visible = false;
+        self.needs_refocus = true;
+        cx.notify();
+    }
+    fn toggle_chat(&mut self, _: &ToggleChat, w: &mut Window, cx: &mut Context<Self>) {
+        self.chat_visible = !self.chat_visible;
+        if self.chat_visible {
+            w.focus(&self.chat_panel.read(cx).focus_handle(cx));
+
+            // Lazy-load inference on first open.
+            let needs_inference = self.chat_panel.read(cx).inference.is_none();
+            if needs_inference {
+                if let Some(model_path) = &self.settings.model_path {
+                    let path = model_path.clone();
+                    let gpu = self.settings.gpu_layers;
+                    let ctx_size = self.settings.ctx_size;
+                    let chat = self.chat_panel.clone();
+                    // Spawn model loading off the main thread so UI doesn't freeze.
+                    cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                        let result = llm::spawn_inference_thread(&path, gpu, ctx_size);
+                        match result {
+                            Ok(handle) => {
+                                eprintln!("[forge] Inference thread started: {}", handle.model_name);
+                                let _ = chat.update(cx, |panel, _cx| {
+                                    panel.set_inference(handle);
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("[forge] Failed to start inference: {e}");
+                            }
+                        }
+                    }).detach();
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn show_search(&mut self, _: &ShowSearch, w: &mut Window, cx: &mut Context<Self>) {
         self.search_visible = !self.search_visible;
         if self.search_visible {
+            self.search_query.clear();
+            self.search_results.clear();
+            self.search_selected = 0;
+            // Clear and focus the search input
+            self.search_input.update(cx, |state, cx| {
+                state.set_value("".to_string(), w, cx);
+            });
             w.focus(&self.search_input.read(cx).focus_handle(cx));
         }
         cx.notify();
+    }
+
+    fn run_search(&mut self) {
+        self.search_selected = 0;
+        if let Some(vs) = &self.vault_search {
+            if !self.search_query.trim().is_empty() {
+                self.search_results = vs.search(&self.search_query, 50).unwrap_or_default();
+            } else {
+                self.search_results.clear();
+            }
+        }
+    }
+
+    fn open_search_result(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(r) = self.search_results.get(idx) {
+            let path = r.chunk.file_path.clone();
+            let byte_start = r.chunk.byte_start;
+            let byte_end = r.chunk.byte_end;
+            self.search_visible = false;
+            self.side_panel = SidePanel::Files;
+            self.open_path_as_tab(path, cx, false);
+            self.editor.update(cx, |ed, cx| {
+                ed.pending_scroll_byte = Some(byte_start);
+                ed.highlight_range = Some((byte_start, byte_end, std::time::Instant::now()));
+                cx.notify();
+            });
+            // Refocus editor so shortcuts work immediately.
+            self.needs_refocus = true;
+        }
     }
 
     fn _consume_backspace(&mut self, _: &editor::Backspace, _: &mut Window, _: &mut Context<Self>) {}
@@ -1020,6 +1201,15 @@ impl ForgeApp {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, w, cx| this.show_settings(&ShowSettings, w, cx)))
             .child(icons::rail_settings_icon(if settings_active { fg } else { muted }));
 
+        let chat_active = self.chat_visible;
+        let chat_btn = div().id("rail-chat")
+            .flex().items_center().justify_center()
+            .w(px(32.)).h(px(32.)).rounded(px(t::RADIUS_MD))
+            .bg(if chat_active { accent.opacity(0.18) } else { transparent_black() })
+            .cursor_pointer().hover(move |s: gpui::StyleRefinement| s.bg(accent.opacity(0.10)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, w, cx| this.toggle_chat(&ToggleChat, w, cx)))
+            .child(icons::rail_chat_icon(if chat_active { fg } else { muted }));
+
         div().flex().flex_col().items_center().gap(px(4.))
             .w(px(44.)).h_full().flex_shrink_0()
             .bg(sidebar_bg).border_r_1().border_color(border)
@@ -1027,6 +1217,7 @@ impl ForgeApp {
             .child(files_btn)
             .child(search_btn)
             .child(graph_btn)
+            .child(chat_btn)
             .child(settings_btn)
     }
 
@@ -1258,55 +1449,110 @@ impl ForgeApp {
         let overlay_bg = if is_dark { hsla(0.0, 0.0, 0.0, 0.5) } else { hsla(0.0, 0.0, 0.0, 0.3) };
         let card_bg = if is_dark { hsla(0.0, 0.0, 0.15, 1.0) } else { hsla(0.0, 0.0, 1.0, 1.0) };
 
+        self.search_scroll.scroll_to_item(self.search_selected);
         let mut results_div = div().id("search-results-list").flex().flex_col()
-            .max_h(px(400.)).overflow_y_scroll();
+            .max_h(px(400.)).overflow_y_scroll()
+            .track_scroll(&self.search_scroll);
 
-        if !self.search_query.is_empty() && self.search_results.is_empty() {
+        let effective_query = self.search_query.trim().trim_matches('"').trim();
+        if !effective_query.is_empty() && self.search_results.is_empty() {
             results_div = results_div.child(
                 div().px(px(20.)).py(px(16.)).text_size(px(13.)).text_color(muted.opacity(0.6))
-                    .child(format!("No results for \"{}\"", self.search_query))
+                    .child(format!("No results for \"{}\"", effective_query))
+            );
+        } else if self.search_query.starts_with('"') && effective_query.is_empty() {
+            results_div = results_div.child(
+                div().px(px(20.)).py(px(16.)).text_size(px(13.)).text_color(muted.opacity(0.5))
+                    .child("Keyword mode: type your search term")
             );
         }
 
+        // Extract query words for highlighting (strip quotes, lowercase).
+        let highlight_words: Vec<String> = self.search_query.trim().trim_matches('"').split_whitespace()
+            .filter(|w| w.len() >= 2)
+            .map(|w| w.to_lowercase())
+            .collect();
+
+        let selected_idx = self.search_selected;
         for (i, result) in self.search_results.iter().enumerate() {
             let file_name = result.chunk.file_path.file_stem()
                 .and_then(|s| s.to_str()).unwrap_or("?").to_string();
-            let heading = result.chunk.heading.clone();
-            // Build preview: show content with query context
-            let preview: String = result.chunk.content.chars().take(150).collect();
+            let heading = strip_md_markers(&result.chunk.heading);
+            let preview = strip_md_markers(&result.chunk.content.chars().take(200).collect::<String>());
             let rel_path = result.chunk.file_path.file_name()
                 .and_then(|s| s.to_str()).unwrap_or("").to_string();
-            let path = result.chunk.file_path.clone();
+            let _path = result.chunk.file_path.clone();
             let score = result.score;
+            let is_selected = i == selected_idx;
+            let sel_bg = if is_selected {
+                if is_dark { hsla(0.0, 0.0, 1.0, 0.10) } else { hsla(0.58, 0.5, 0.5, 0.12) }
+            } else {
+                transparent_black()
+            };
+            let hover_bg = if is_dark { hsla(0.0, 0.0, 1.0, 0.06) } else { hsla(0.0, 0.0, 0.0, 0.04) };
+            let sel_left = if is_selected { accent } else { transparent_black() };
 
             results_div = results_div.child(
                 div().id(ElementId::NamedInteger("sresult".into(), i as u64))
-                    .flex().flex_col().gap(px(2.))
-                    .px(px(16.)).py(px(8.))
-                    .border_b_1().border_color(border.opacity(0.2))
+                    .flex().flex_col().gap(px(1.))
+                    .px(px(14.)).py(px(8.))
+                    .border_b_1().border_color(border.opacity(0.15))
+                    .border_l_2().border_color(sel_left)
+                    .bg(sel_bg)
                     .cursor_pointer()
-                    .hover(move |s: gpui::StyleRefinement| s.bg(accent.opacity(0.08)))
-                    .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                        this.search_visible = false;
-                        this.side_panel = SidePanel::Files;
-                        this.open_path_as_tab(path.clone(), cx, false);
+                    .hover(move |s: gpui::StyleRefinement| s.bg(hover_bg))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.open_search_result(i, cx);
                     }))
-                    // Row 1: file name + score
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if this.search_selected != i {
+                            this.search_selected = i;
+                            cx.notify();
+                        }
+                    }))
                     .child(
                         div().flex().flex_row().items_center().justify_between()
-                            .child(div().flex().flex_row().items_center().gap(px(8.))
-                                .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).child(file_name))
-                                .child(div().text_size(px(11.)).text_color(accent.opacity(0.7)).child(heading))
+                            .child(div().flex().flex_row().items_center().gap(px(6.))
+                                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).child(file_name))
+                                .child({
+                                    let hl_bg2 = if is_dark { hsla(55.0/360.0, 0.8, 0.45, 0.3) } else { hsla(55.0/360.0, 1.0, 0.55, 0.35) };
+                                    let hspans = highlight_text(&heading, &highlight_words);
+                                    let mut hrow = div().flex().flex_row().text_size(px(11.));
+                                    for (t, m) in hspans {
+                                        if m {
+                                            hrow = hrow.child(div().bg(hl_bg2).text_color(fg).rounded(px(2.)).child(t));
+                                        } else {
+                                            hrow = hrow.child(div().text_color(muted.opacity(0.6)).child(t));
+                                        }
+                                    }
+                                    hrow
+                                })
                             )
                             .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
                                 .child(format!("{:.0}%", score * 100.0)))
                     )
-                    // Row 2: content preview
-                    .child(div().text_size(px(12.)).text_color(muted.opacity(0.8))
-                        .overflow_hidden().whitespace_nowrap().text_ellipsis()
-                        .child(preview))
-                    // Row 3: file path
-                    .child(div().text_size(px(10.)).text_color(muted.opacity(0.4)).child(rel_path))
+                    .child({
+                        let hl_bg = if is_dark { hsla(55.0/360.0, 0.8, 0.45, 0.35) } else { hsla(55.0/360.0, 1.0, 0.55, 0.4) };
+                        let spans = highlight_text(&preview, &highlight_words);
+                        let mut row = div().flex().flex_row().flex_wrap()
+                            .text_size(px(12.)).overflow_hidden();
+                        for (text, matched) in spans {
+                            if matched {
+                                row = row.child(
+                                    div().bg(hl_bg).text_color(fg)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .rounded(px(2.))
+                                        .child(text)
+                                );
+                            } else {
+                                row = row.child(
+                                    div().text_color(muted.opacity(0.7)).child(text)
+                                );
+                            }
+                        }
+                        row
+                    })
+                    .child(div().text_size(px(10.)).text_color(muted.opacity(0.35)).child(rel_path))
             );
         }
 
@@ -1317,14 +1563,16 @@ impl ForgeApp {
             // Full-screen overlay backdrop
             div().id("search-overlay").absolute().top(px(0.)).left(px(0.)).size_full()
                 .bg(overlay_bg)
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    // Click backdrop to close
+                .overflow_hidden()
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.search_visible = false;
+                    this.needs_refocus = true;
                     cx.notify();
                 }))
+                .on_scroll_wheel(cx.listener(|_, _, _, _| { /* block scroll passthrough */ }))
                 .flex().justify_center().pt(px(80.))
                 .child(
-                    // Modal card (stop click propagation by having its own mouse handler)
+                    // Modal card: captures ALL keyboard input directly
                     div().id("search-modal-card")
                         .w(px(650.)).max_h(px(520.))
                         .bg(card_bg)
@@ -1333,10 +1581,43 @@ impl ForgeApp {
                         .shadow_lg()
                         .flex().flex_col()
                         .on_mouse_down(MouseButton::Left, |_, _, _| { /* stop propagation */ })
+                        // Capture-phase key handler: fires BEFORE the Input child processes keys.
+                        // This lets us intercept arrows + escape without the Input swallowing them.
+                        .capture_key_down({
+                            let entity = cx.entity().clone();
+                            move |event: &KeyDownEvent, _w: &mut Window, cx: &mut App| {
+                                let key = event.keystroke.key.as_str();
+                                match key {
+                                    "down" | "up" | "escape" => {
+                                        entity.update(cx, |this, cx| {
+                                            match key {
+                                                "down" => {
+                                                    if !this.search_results.is_empty() {
+                                                        this.search_selected = (this.search_selected + 1).min(this.search_results.len() - 1);
+                                                    }
+                                                }
+                                                "up" => {
+                                                    this.search_selected = this.search_selected.saturating_sub(1);
+                                                }
+                                                "escape" => {
+                                                    this.search_visible = false;
+                                                }
+                                                _ => {}
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                    _ => {} // Let everything else through to the Input
+                                }
+                            }
+                        })
                         // Input row
-                        .child(
+                        .child({
+                            let is_keyword_mode = self.search_query.trim_start().starts_with('"');
+                            let mode_label = if is_keyword_mode { "BM25" } else { "hybrid" };
+                            let mode_color = if is_keyword_mode { accent } else { muted.opacity(0.4) };
                             div().flex().flex_row().items_center()
-                                .px(px(16.)).py(px(12.))
+                                .px(px(16.)).py(px(10.))
                                 .border_b_1().border_color(border.opacity(0.3))
                                 .child(
                                     div().text_size(px(14.)).text_color(muted.opacity(0.5)).pr(px(8.)).child("\u{1F50D}")
@@ -1346,7 +1627,13 @@ impl ForgeApp {
                                         Input::new(&self.search_input).appearance(false).bordered(false)
                                     )
                                 )
-                        )
+                                .child(
+                                    div().text_size(px(9.)).text_color(mode_color).pl(px(8.))
+                                        .px(px(6.)).py(px(2.)).rounded(px(3.))
+                                        .border_1().border_color(mode_color.opacity(0.5))
+                                        .child(mode_label)
+                                )
+                        })
                         // Results
                         .child(results_div)
                         // Footer
@@ -1357,7 +1644,7 @@ impl ForgeApp {
                                 .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
                                     .child(format!("{} chunks indexed{}", chunk_count, if has_vectors { " · semantic" } else { "" })))
                                 .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
-                                    .child("esc to close"))
+                                    .child("\u{2191}\u{2193} navigate  \u{21B5} open  esc close  \" keyword only"))
                         )
                 )
                 .into_any_element()
@@ -1503,7 +1790,12 @@ impl Focusable for ForgeApp {
 }
 
 impl Render for ForgeApp {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One-shot refocus: only fires when explicitly requested, then clears.
+        if self.needs_refocus {
+            self.needs_refocus = false;
+            w.focus(&self.editor.focus_handle(cx));
+        }
         let bg = cx.theme().background;
         let fg = cx.theme().foreground;
         let sidebar_bg = cx.theme().sidebar;
@@ -1803,6 +2095,25 @@ impl Render for ForgeApp {
                 }
                 main_row = main_row.child(main_content);
                 if let Some(sb) = scrollbar_col { main_row = main_row.child(sb); }
+
+                // Chat panel (right side)
+                if self.chat_visible {
+                    let chat_w = self.settings.chat_panel_width;
+                    main_row = main_row.child(
+                        div().id("chat-resize").w(px(4.)).h_full().flex_shrink_0()
+                            .cursor_col_resize()
+                            .hover(move |s: gpui::StyleRefinement| s.bg(border.opacity(0.6)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, _| {
+                                let x: f32 = event.position.x.into();
+                                this.chat_drag = Some(x);
+                            }))
+                    );
+                    main_row = main_row.child(
+                        div().flex().flex_col().flex_shrink_0()
+                            .w(px(chat_w)).h_full()
+                            .child(self.chat_panel.clone())
+                    );
+                }
             }
             SidePanel::Graph => {
                 main_row = main_row.child(
@@ -1832,6 +2143,16 @@ impl Render for ForgeApp {
                     cx.notify();
                     return;
                 }
+                // Chat panel resize drag.
+                if let Some(start_x) = this.chat_drag {
+                    let mx: f32 = event.position.x.into();
+                    let delta = start_x - mx; // dragging left = larger panel
+                    let new_w = (this.settings.chat_panel_width + delta).clamp(250.0, 800.0);
+                    this.settings.chat_panel_width = new_w;
+                    this.chat_drag = Some(mx);
+                    cx.notify();
+                    return;
+                }
                 // Scrollbar drag
                 let Some(drag) = this.scrollbar_drag.as_ref() else { return; };
                 let click_y: f32 = event.position.y.into();
@@ -1848,7 +2169,11 @@ impl Render for ForgeApp {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
                 if this.sidebar_drag.is_some() {
                     this.sidebar_drag = None;
-                    this.settings.save(); // persist new width
+                    this.settings.save();
+                }
+                if this.chat_drag.is_some() {
+                    this.chat_drag = None;
+                    this.settings.save();
                 }
                 this.scrollbar_drag = None;
             }))
@@ -1864,10 +2189,14 @@ impl Render for ForgeApp {
             .on_action(cx.listener(Self::refresh_vault))
             .on_action(cx.listener(Self::toggle_readable_width))
             .on_action(cx.listener(Self::toggle_backlinks))
+            .on_action(cx.listener(Self::search_down))
+            .on_action(cx.listener(Self::search_up))
+            .on_action(cx.listener(Self::search_close))
             .on_action(cx.listener(Self::show_files))
             .on_action(cx.listener(Self::show_graph))
             .on_action(cx.listener(Self::show_settings))
             .on_action(cx.listener(Self::show_search))
+            .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::nav_back))
             .on_action(cx.listener(Self::nav_forward))
             .on_action(cx.listener(Self::ctx_open))
@@ -1915,39 +2244,27 @@ pub fn run_app() {
         gpui_component::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
-            // App-level
-            KeyBinding::new("ctrl-o", OpenFolder, Some("ForgeApp")),
-            KeyBinding::new("ctrl-s", Save, Some("ForgeApp")),
-            KeyBinding::new("ctrl-s", Save, Some("Editor")),
+            // Global shortcuts (work regardless of focus)
+            KeyBinding::new("ctrl-o", OpenFolder, None),
+            KeyBinding::new("ctrl-s", Save, None),
             KeyBinding::new("ctrl-q", Quit, None),
-            KeyBinding::new("ctrl-shift-t", ToggleTheme, Some("ForgeApp")),
-            KeyBinding::new("ctrl-shift-t", ToggleTheme, Some("Editor")),
-            KeyBinding::new("ctrl-n", NewFile, Some("ForgeApp")),
-            KeyBinding::new("ctrl-n", NewFile, Some("Editor")),
-            // Tab management
-            KeyBinding::new("ctrl-w", CloseTab, Some("ForgeApp")),
-            KeyBinding::new("ctrl-w", CloseTab, Some("Editor")),
-            KeyBinding::new("ctrl-tab", NextTab, Some("ForgeApp")),
-            KeyBinding::new("ctrl-tab", NextTab, Some("Editor")),
-            KeyBinding::new("ctrl-shift-tab", PrevTab, Some("ForgeApp")),
-            KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Editor")),
-            KeyBinding::new("f5", RefreshVault, Some("ForgeApp")),
-            KeyBinding::new("f5", RefreshVault, Some("Editor")),
-            KeyBinding::new("ctrl-r", RefreshVault, Some("ForgeApp")),
-            KeyBinding::new("ctrl-r", RefreshVault, Some("Editor")),
-            KeyBinding::new("ctrl-shift-r", ToggleReadableWidth, Some("ForgeApp")),
-            KeyBinding::new("ctrl-shift-r", ToggleReadableWidth, Some("Editor")),
-            KeyBinding::new("ctrl-shift-b", ToggleBacklinks, Some("ForgeApp")),
-            KeyBinding::new("ctrl-shift-b", ToggleBacklinks, Some("Editor")),
-            KeyBinding::new("ctrl-shift-f", ShowSearch, Some("ForgeApp")),
-            KeyBinding::new("ctrl-shift-f", ShowSearch, Some("Editor")),
-            // Navigation (back / forward across file history)
-            KeyBinding::new("alt-left", NavBack, Some("ForgeApp")),
-            KeyBinding::new("alt-left", NavBack, Some("Editor")),
-            KeyBinding::new("alt-right", NavForward, Some("ForgeApp")),
-            KeyBinding::new("alt-right", NavForward, Some("Editor")),
-            KeyBinding::new("ctrl-alt-left", NavBack, Some("ForgeApp")),
-            KeyBinding::new("ctrl-alt-right", NavForward, Some("ForgeApp")),
+            KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
+            KeyBinding::new("ctrl-n", NewFile, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+            KeyBinding::new("f5", RefreshVault, None),
+            KeyBinding::new("ctrl-r", RefreshVault, None),
+            KeyBinding::new("ctrl-shift-r", ToggleReadableWidth, None),
+            KeyBinding::new("ctrl-shift-b", ToggleBacklinks, None),
+            KeyBinding::new("ctrl-shift-f", ShowSearch, None),
+            KeyBinding::new("ctrl-shift-l", ToggleChat, None),
+            KeyBinding::new("alt-left", NavBack, None),
+            KeyBinding::new("alt-right", NavForward, None),
+            // Search navigation (ForgeApp context -- only when search is open)
+            KeyBinding::new("down", SearchDown, Some("ForgeApp")),
+            KeyBinding::new("up", SearchUp, Some("ForgeApp")),
+            KeyBinding::new("escape", SearchClose, Some("ForgeApp")),
             // Movement
             KeyBinding::new("left", editor::MoveLeft, Some("Editor")),
             KeyBinding::new("right", editor::MoveRight, Some("Editor")),
