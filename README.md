@@ -15,19 +15,6 @@ Built on [GPUI](https://github.com/zed-industries/zed) (Zed's GPU rendering engi
 
 ## Installation
 
-### AppImage (recommended)
-
-Download the latest `Forge-x86_64.AppImage` from [Releases](https://github.com/srisha6505/forge/releases), then:
-
-```bash
-chmod +x Forge-x86_64.AppImage
-./Forge-x86_64.AppImage
-```
-
-No installation required. Works on any Linux distro with Vulkan GPU drivers.
-
-### Build from source
-
 Requires Rust 1.80+ and a C/C++ toolchain.
 
 ```bash
@@ -51,13 +38,6 @@ cargo build --release
 | Ubuntu/Debian | `cmake pkg-config libvulkan-dev glslc libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev` |
 | Fedora | `cmake gcc-c++ vulkan-devel glslc libxkbcommon-devel libxcb-devel` |
 | Arch | `cmake vulkan-devel shaderc libxkbcommon libxcb` |
-
-### Build AppImage locally
-
-```bash
-./packaging/build-appimage.sh
-# Output: Forge-x86_64.AppImage
-```
 
 ## Getting Started
 
