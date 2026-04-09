@@ -38,6 +38,7 @@ pub enum UiMessage {
         args: String,
         result: Option<String>,
         is_error: bool,
+        result_visible: bool,
     },
     Error { message: String },
 }
@@ -361,7 +362,7 @@ impl ChatPanel {
                     self.end_streaming();
                     if let Some(s) = self.sessions.get_mut(self.active_session) {
                         s.ui_messages.push(UiMessage::ToolCall {
-                            name, args, result: None, is_error: false,
+                            name, args, result: None, is_error: false, result_visible: false,
                         });
                     }
                 }
@@ -443,24 +444,24 @@ impl Render for ChatPanel {
         let active_idx = self.active_session;
         let is_busy = self.sessions.get(self.active_session).map(|s| s.busy).unwrap_or(false);
 
-        // ── Tab bar ──
+        // ── Tab bar (minimal) ──
         let mut tab_bar = div()
             .id("chat-tab-bar")
             .flex().flex_row().items_center()
-            .w_full().h(px(32.)).flex_shrink_0()
+            .w_full().h(px(28.)).flex_shrink_0()
             .bg(panel_bg).border_b_1().border_color(border)
-            .px(px(6.)).gap(px(2.));
+            .px(px(8.)).gap(px(1.));
 
         for i in 0..session_count {
             let name = self.sessions[i].name.clone();
             let active = i == active_idx;
             tab_bar = tab_bar.child(
                 div().id(ElementId::NamedInteger("ct".into(), i as u64))
-                    .flex().items_center().px(px(10.)).py(px(3.))
-                    .rounded(px(4.)).text_size(px(11.)).cursor_pointer()
-                    .bg(if active { accent.opacity(0.12) } else { transparent_black() })
-                    .text_color(if active { fg } else { muted })
-                    .hover(move |s: StyleRefinement| s.bg(accent.opacity(0.08)))
+                    .flex().items_center().px(px(8.)).py(px(2.))
+                    .rounded(px(3.)).text_size(px(11.)).cursor_pointer()
+                    .text_color(if active { fg } else { muted.opacity(0.6) })
+                    .bg(if active { border.opacity(0.3) } else { transparent_black() })
+                    .hover(move |s: StyleRefinement| s.bg(border.opacity(0.2)))
                     .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                         this.active_session = i; cx.notify();
                     }))
@@ -470,22 +471,20 @@ impl Render for ChatPanel {
         // + button
         tab_bar = tab_bar.child(
             div().id("ct-new").flex().items_center().justify_center()
-                .w(px(22.)).h(px(22.)).rounded(px(4.))
-                .cursor_pointer().text_size(px(14.)).text_color(muted)
-                .hover(move |s: StyleRefinement| s.bg(accent.opacity(0.08)))
+                .w(px(20.)).h(px(20.)).rounded(px(3.))
+                .cursor_pointer().text_size(px(13.)).text_color(muted.opacity(0.4))
+                .hover(move |s: StyleRefinement| s.bg(border.opacity(0.2)).text_color(muted))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.new_session(cx); cx.notify();
                 }))
                 .child("+")
         );
-        // Spacer + clear button
         tab_bar = tab_bar.child(div().flex_1());
         tab_bar = tab_bar.child(
             div().id("ct-clear")
-                .flex().items_center().justify_center()
-                .px(px(6.)).py(px(2.)).rounded(px(4.))
-                .cursor_pointer().text_size(px(10.)).text_color(muted.opacity(0.5))
-                .hover(move |s: StyleRefinement| s.bg(accent.opacity(0.08)).text_color(muted))
+                .flex().items_center().px(px(6.)).py(px(1.)).rounded(px(3.))
+                .cursor_pointer().text_size(px(10.)).text_color(muted.opacity(0.35))
+                .hover(move |s: StyleRefinement| s.bg(border.opacity(0.2)).text_color(muted.opacity(0.7)))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.clear_session(cx);
                 }))
@@ -499,70 +498,51 @@ impl Render for ChatPanel {
             .flex_1().min_h(px(0.)).min_w(px(0.))
             .overflow_y_scroll().overflow_x_hidden()
             .track_scroll(&self.scroll)
-            .px(px(10.)).py(px(8.)).gap(px(6.));
+            .px(px(12.)).py(px(10.)).gap(px(2.));
 
         if let Some(session) = self.sessions.get(self.active_session) {
             if session.ui_messages.is_empty() {
                 if self.inference.is_none() {
+                    // Empty state: not connected -- minimal setup hint.
                     msg_list = msg_list.child(
-                        div().flex_1().flex().flex_col().items_center().justify_center().gap(px(16.))
-                            .child(div().text_size(px(16.)).text_color(fg).font_weight(FontWeight::SEMIBOLD)
-                                .child("Forge Agent"))
-                            .child(div().text_size(px(12.)).text_color(muted).max_w(px(280.))
-                                .child("Add your provider in ~/.config/forge/settings.json:"))
-                            // Anthropic API key
-                            .child(
-                                div().flex().flex_col().gap(px(4.)).px(px(12.)).py(px(8.))
-                                    .rounded(px(6.)).bg(border.opacity(0.2)).max_w(px(320.))
-                                    .child(div().text_size(px(11.)).text_color(accent)
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Claude API (recommended)"))
-                                    .child(div().text_size(px(10.)).text_color(muted)
-                                        .font_family("monospace")
-                                        .child("\"ai_provider\": \"anthropic\""))
-                                    .child(div().text_size(px(10.)).text_color(muted)
-                                        .font_family("monospace")
-                                        .child("\"api_key\": \"sk-ant-...\""))
-                                    .child(div().text_size(px(9.)).text_color(muted.opacity(0.5))
-                                        .child("Get key: console.anthropic.com/settings/keys"))
-                            )
-                            // Local model
-                            .child(
-                                div().flex().flex_col().gap(px(4.)).px(px(12.)).py(px(8.))
-                                    .rounded(px(6.)).bg(border.opacity(0.2)).max_w(px(320.))
-                                    .child(div().text_size(px(11.)).text_color(fg.opacity(0.7))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Local GGUF model"))
-                                    .child(div().text_size(px(10.)).text_color(muted)
-                                        .font_family("monospace")
-                                        .child("\"ai_provider\": \"local\""))
-                                    .child(div().text_size(px(10.)).text_color(muted)
-                                        .font_family("monospace")
-                                        .child("\"model_path\": \"/path/to/model.gguf\""))
-                            )
+                        div().flex_1().flex().flex_col().items_center().justify_center().gap(px(12.))
+                            .child(div().text_size(px(14.)).text_color(muted.opacity(0.5))
+                                .child("No model connected"))
+                            .child(div().text_size(px(11.)).text_color(muted.opacity(0.35))
+                                .child("Configure a provider in ~/.config/forge/settings.json"))
                     );
                 } else {
+                    // Empty state: connected -- just a quiet prompt.
                     msg_list = msg_list.child(
                         div().flex_1().flex().items_center().justify_center()
-                            .child(div().text_size(px(12.)).text_color(muted.opacity(0.5))
-                                .child("Ask a question about your vault"))
+                            .child(div().text_size(px(13.)).text_color(muted.opacity(0.4))
+                                .child("Ask anything about your vault"))
                     );
                 }
             }
 
             for (idx, msg) in session.ui_messages.iter().enumerate() {
-                let el = render_msg(msg, idx, fg, muted, accent, border);
                 let i = idx;
-                // Thinking toggle click handler.
+                let el = render_msg(msg, idx, fg, muted, accent, border);
+                // Click handler for toggleable elements (thinking, tool results).
                 msg_list = msg_list.child(
                     div()
                         .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                             if let Some(s) = this.sessions.get_mut(this.active_session) {
-                                if let Some(UiMessage::Assistant { thinking_visible, thinking, .. }) = s.ui_messages.get_mut(i) {
-                                    if thinking.is_some() {
-                                        *thinking_visible = !*thinking_visible;
-                                        cx.notify();
+                                match s.ui_messages.get_mut(i) {
+                                    Some(UiMessage::Assistant { thinking_visible, thinking, .. }) => {
+                                        if thinking.is_some() {
+                                            *thinking_visible = !*thinking_visible;
+                                            cx.notify();
+                                        }
                                     }
+                                    Some(UiMessage::ToolCall { result_visible, result, .. }) => {
+                                        if result.is_some() {
+                                            *result_visible = !*result_visible;
+                                            cx.notify();
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }))
@@ -575,7 +555,6 @@ impl Render for ChatPanel {
         let model_label = self.inference.as_ref()
             .map(|h| h.model_name.clone())
             .unwrap_or_else(|| "no model".into());
-        let status_label = if is_busy { "generating..." } else { "idle" };
 
         let input_row = div()
             .flex().flex_row().gap(px(6.)).items_center()
@@ -588,12 +567,12 @@ impl Render for ChatPanel {
             input_row.child(
                 div().id("chat-stop")
                     .flex().items_center().justify_center()
-                    .px(px(8.)).py(px(4.)).rounded(px(4.))
+                    .px(px(8.)).py(px(3.)).rounded(px(4.))
                     .cursor_pointer()
-                    .bg(hsla(0.0, 0.6, 0.5, 0.15))
+                    .bg(hsla(0.0, 0.6, 0.5, 0.12))
                     .text_size(px(11.)).text_color(hsla(0.0, 0.6, 0.5, 1.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .hover(move |s: StyleRefinement| s.bg(hsla(0.0, 0.6, 0.5, 0.25)))
+                    .font_weight(FontWeight::MEDIUM)
+                    .hover(move |s: StyleRefinement| s.bg(hsla(0.0, 0.6, 0.5, 0.22)))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.stop_generation(cx);
                     }))
@@ -603,20 +582,26 @@ impl Render for ChatPanel {
             input_row
         };
 
+        // Status bar: model name + status dot.
+        let status_color = if is_busy { accent } else { muted.opacity(0.3) };
+        let status_text = if is_busy { "generating" } else { "ready" };
+
         let input_area = div()
             .id("chat-input")
             .flex().flex_col().w_full().flex_shrink_0()
             .border_t_1().border_color(border)
             .bg(panel_bg)
-            .px(px(10.)).py(px(6.)).gap(px(3.))
+            .px(px(12.)).py(px(6.)).gap(px(3.))
             .child(input_row)
             .child(
-                div().flex().flex_row().items_center().gap(px(6.))
+                div().flex().flex_row().items_center().gap(px(4.))
+                    .child(
+                        div().w(px(5.)).h(px(5.)).rounded(px(3.)).bg(status_color)
+                    )
                     .child(div().text_size(px(10.)).text_color(muted.opacity(0.4))
-                        .child(format!("{model_label} | {status_label}")))
-                    .child(div().flex_1())
+                        .child(format!("{model_label}")))
                     .child(div().text_size(px(10.)).text_color(muted.opacity(0.3))
-                        .child("Enter to send | Ctrl+Shift+L toggle"))
+                        .child(format!("\u{00B7} {status_text}")))
             );
 
         // ── Assemble ──
@@ -635,6 +620,36 @@ impl Render for ChatPanel {
 
 // ── Message rendering ──
 
+/// Build a compact one-liner description for a tool call.
+fn tool_summary(name: &str, args: &str) -> String {
+    // Parse args JSON to extract relevant fields for a human-readable summary.
+    let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    match name {
+        "search_vault" => {
+            let q = parsed.get("query").and_then(|v| v.as_str()).unwrap_or("...");
+            format!("Searched vault for '{q}'")
+        }
+        "read_file" => {
+            let p = parsed.get("path").and_then(|v| v.as_str()).unwrap_or("...");
+            format!("Read file {p}")
+        }
+        "list_files" => {
+            let d = parsed.get("directory").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("Listed files in {d}")
+        }
+        "read_section" => {
+            let p = parsed.get("path").and_then(|v| v.as_str()).unwrap_or("...");
+            let h = parsed.get("heading").and_then(|v| v.as_str()).unwrap_or("...");
+            format!("Read section '{h}' from {p}")
+        }
+        other => {
+            // Fallback: tool name + truncated args.
+            let short = if args.len() > 60 { format!("{}...", &args[..60]) } else { args.to_string() };
+            format!("{other}({short})")
+        }
+    }
+}
+
 fn render_msg(
     msg: &UiMessage,
     idx: usize,
@@ -646,55 +661,60 @@ fn render_msg(
     let id = ElementId::NamedInteger("cm".into(), idx as u64);
 
     match msg {
-        // ── User ──
+        // ── User message: subtle tinted background ──
         UiMessage::User { content } => {
-            div().id(id).flex().flex_col().gap(px(2.))
-                .px(px(10.)).py(px(6.)).rounded(px(6.))
-                .bg(accent.opacity(0.06))
-                .child(
-                    div().text_size(px(10.)).text_color(accent.opacity(0.7))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("You")
-                )
+            div().id(id).flex().flex_col()
+                .px(px(10.)).py(px(8.)).mt(px(4.))
+                .rounded(px(6.))
+                .bg(accent.opacity(0.05))
                 .child(div().text_size(px(13.)).text_color(fg).child(content.clone()))
         }
 
-        // ── Assistant ──
+        // ── Assistant message: no background, just text ──
         UiMessage::Assistant { content, thinking, thinking_visible, streaming } => {
-            let mut el = div().id(id).flex().flex_col().gap(px(2.))
-                .px(px(10.)).py(px(6.)).rounded(px(6.));
+            let mut el = div().id(id).flex().flex_col()
+                .px(px(10.)).py(px(4.));
 
-            // Thinking toggle.
+            // Thinking: collapsed by default, just "Thinking..." italic.
             if let Some(thought) = thinking {
                 if !thought.is_empty() {
                     let vis = *thinking_visible;
-                    let arrow = if vis { "\u{25BE}" } else { "\u{25B8}" }; // down/right triangle
-                    let label = format!("{arrow} Thinking ({} chars)", thought.len());
-                    let mut think_el = div().flex().flex_col().mb(px(2.))
-                        .child(
-                            div().text_size(px(10.)).text_color(muted.opacity(0.5))
-                                .cursor_pointer()
-                                .child(label)
-                        );
                     if vis {
-                        think_el = think_el.child(
+                        // Expanded: show the thinking text.
+                        el = el.child(
+                            div().flex().flex_col().mb(px(4.))
+                                .child(
+                                    div().text_size(px(11.)).text_color(muted.opacity(0.45))
+
+                                        .cursor_pointer()
+                                        .child("Thinking \u{25BE}")
+                                )
+                                .child(
+                                    div().text_size(px(11.)).text_color(muted.opacity(0.4))
+                                        .px(px(6.)).py(px(4.)).mt(px(2.))
+                                        .rounded(px(4.)).bg(border.opacity(0.15))
+                                        .max_h(px(150.)).overflow_hidden()
+                                        .child(thought.clone())
+                                )
+                        );
+                    } else {
+                        // Collapsed: subtle italic label.
+                        el = el.child(
                             div().text_size(px(11.)).text_color(muted.opacity(0.4))
-                                .px(px(8.)).py(px(4.)).mt(px(2.))
-                                .rounded(px(4.)).bg(border.opacity(0.3))
-                                .max_h(px(120.)).overflow_hidden()
-                                .child(thought.clone())
+
+                                .cursor_pointer().mb(px(2.))
+                                .child("Thinking...")
                         );
                     }
-                    el = el.child(think_el);
                 }
             }
 
-            // Content.
+            // Content: render markdown.
             if !content.is_empty() {
                 el = el.child(md(content, fg, muted, accent, border));
             } else if *streaming {
                 el = el.child(
-                    div().text_size(px(11.)).text_color(muted.opacity(0.5))
+                    div().text_size(px(12.)).text_color(muted.opacity(0.4))
                         .child(if thinking.is_some() { "Thinking..." } else { "..." })
                 );
             }
@@ -702,53 +722,91 @@ fn render_msg(
             el
         }
 
-        // ── Tool call ──
-        UiMessage::ToolCall { name, args, result, is_error } => {
-            let c = hsla(0.08, 0.65, 0.5, 1.0); // orange
+        // ── Tool call: compact one-liner ──
+        UiMessage::ToolCall { name, args, result, is_error, result_visible } => {
+            let summary = tool_summary(name, args);
+            let dot_color = if *is_error {
+                hsla(0.0, 0.7, 0.55, 1.0) // red
+            } else {
+                hsla(0.55, 0.5, 0.55, 1.0) // teal/blue-ish
+            };
+
+            let done = result.is_some();
+            let vis = *result_visible;
+
             let mut el = div().id(id).flex().flex_col()
-                .px(px(10.)).py(px(4.)).rounded(px(4.))
-                .bg(c.opacity(0.04))
-                .border_l_2().border_color(c.opacity(0.4))
+                .px(px(10.)).py(px(1.));
+
+            // Main one-liner row.
+            let mut row = div().flex().flex_row().items_center().gap(px(6.))
                 .child(
-                    div().flex().flex_row().items_center().gap(px(6.))
-                        .child(div().text_size(px(10.)).text_color(c).font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("\u{2699} {name}"))) // gear icon
-                        .child(div().text_size(px(9.)).text_color(muted.opacity(0.5))
-                            .child(if result.is_some() { "done" } else { "running..." }))
+                    div().text_size(px(12.)).text_color(dot_color)
+                        .child("\u{2022}") // bullet dot
+                )
+                .child(
+                    div().text_size(px(12.)).text_color(muted.opacity(0.7))
+                        .child(summary)
                 );
 
-            // Args (compact).
-            let args_short = if args.len() > 120 { format!("{}...", &args[..120]) } else { args.clone() };
-            el = el.child(
-                div().text_size(px(10.)).text_color(muted.opacity(0.6))
-                    .font_family("monospace")
-                    .mt(px(1.)).overflow_x_hidden()
-                    .child(args_short)
-            );
-
-            // Result.
-            if let Some(r) = result {
-                let display = if r.len() > 250 { format!("{}...", &r[..250]) } else { r.clone() };
-                let rc = if *is_error { hsla(0.0, 0.7, 0.5, 0.8) } else { muted.opacity(0.5) };
-                el = el.child(
-                    div().text_size(px(10.)).text_color(rc)
-                        .font_family("monospace")
-                        .mt(px(2.)).max_h(px(80.)).overflow_hidden()
-                        .child(display)
+            if done {
+                if *is_error {
+                    row = row.child(
+                        div().text_size(px(9.)).text_color(hsla(0.0, 0.7, 0.55, 0.8))
+                            .px(px(4.)).py(px(1.)).rounded(px(3.))
+                            .bg(hsla(0.0, 0.7, 0.55, 0.08))
+                            .child("error")
+                    );
+                } else {
+                    row = row.child(
+                        div().text_size(px(9.)).text_color(muted.opacity(0.35))
+                            .px(px(4.)).py(px(1.)).rounded(px(3.))
+                            .bg(border.opacity(0.15))
+                            .child("done")
+                    );
+                }
+                // "Show result" / "Hide result" toggle.
+                row = row.child(
+                    div().text_size(px(9.)).text_color(accent.opacity(0.5))
+                        .cursor_pointer()
+                        .hover(move |s: StyleRefinement| s.text_color(accent.opacity(0.8)))
+                        .child(if vis { "hide" } else { "show" })
                 );
+            } else {
+                row = row.child(
+                    div().text_size(px(9.)).text_color(muted.opacity(0.35))
+                        .child("running...")
+                );
+            }
+
+            el = el.child(row);
+
+            // Expanded result (hidden by default).
+            if vis {
+                if let Some(r) = result {
+                    let rc = if *is_error { hsla(0.0, 0.7, 0.5, 0.7) } else { muted.opacity(0.45) };
+                    el = el.child(
+                        div().text_size(px(10.)).text_color(rc)
+                            .font_family("monospace")
+                            .px(px(18.)).py(px(4.)).mt(px(2.))
+                            .rounded(px(4.)).bg(border.opacity(0.1))
+                            .max_h(px(200.)).overflow_hidden()
+                            .child(r.clone())
+                    );
+                }
             }
 
             el
         }
 
-        // ── Error ──
+        // ── Error: red text, compact ──
         UiMessage::Error { message } => {
             let red = hsla(0.0, 0.7, 0.5, 1.0);
-            div().id(id).flex().flex_col().gap(px(2.))
-                .px(px(10.)).py(px(6.)).rounded(px(6.))
-                .bg(red.opacity(0.06))
-                .child(div().text_size(px(10.)).text_color(red).font_weight(FontWeight::SEMIBOLD).child("Error"))
-                .child(div().text_size(px(12.)).text_color(fg).child(message.clone()))
+            div().id(id)
+                .px(px(10.)).py(px(4.))
+                .child(
+                    div().text_size(px(12.)).text_color(red)
+                        .child(message.clone())
+                )
         }
     }
 }
