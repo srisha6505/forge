@@ -5,7 +5,7 @@
 //! model finishes or the iteration cap is reached.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use crate::llm::{ChatMessage, InferenceEvent, InferenceHandle, ToolCall};
@@ -182,7 +182,7 @@ fn exec_search_vault(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
     }
 
     let mut stmt = match db.prepare(
-        "SELECT c.file_path, c.heading, substr(c.content, 1, 300), f.rank \
+        "SELECT c.file_path, c.heading, substr(c.content, 1, 150), f.rank \
          FROM chunks_fts f \
          JOIN chunks c ON c.id = f.rowid \
          WHERE chunks_fts MATCH ?1 \
@@ -262,8 +262,8 @@ fn exec_read_file(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
     match fs::read_to_string(&full_path) {
         Ok(content) => {
             // Truncate very large files.
-            let truncated = if content.len() > 8000 {
-                format!("{}...\n\n[truncated, {} bytes total]", &content[..8000], content.len())
+            let truncated = if content.len() > 800 {
+                format!("{}...\n\n[truncated, {} bytes total]", &content[..800], content.len())
             } else {
                 content
             };

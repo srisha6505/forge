@@ -307,9 +307,13 @@ fn process_request(
         if in_thinking {
             thinking_buf.push_str(&piece);
             // Check if thinking block ended.
-            if let Some(end_pos) = thinking_buf.find("</channel>") {
+            // Gemma uses <channel|> as closing, other models use </channel>.
+            let end_tag = thinking_buf.find("</channel>").map(|p| (p, "</channel>".len()))
+                .or_else(|| thinking_buf.find("<channel|>").map(|p| (p, "<channel|>".len())))
+                .or_else(|| thinking_buf.find("<|channel|>").map(|p| (p, "<|channel|>".len())));
+            if let Some((end_pos, tag_len)) = end_tag {
                 let thought = thinking_buf[..end_pos].to_string();
-                let remainder = thinking_buf[end_pos + "</channel>".len()..].to_string();
+                let remainder = thinking_buf[end_pos + tag_len..].to_string();
                 if !thought.trim().is_empty() {
                     let _ = tx.send(InferenceEvent::Thinking(thought));
                 }
@@ -321,14 +325,15 @@ fn process_request(
             text_buf.push_str(&piece);
 
             // Check if a thinking block starts.
-            if let Some(start_pos) = text_buf.find("<channel>") {
-                // Flush text before the tag.
+            // Gemma uses <|channel>, other models use <channel>.
+            let channel_start = text_buf.find("<|channel>").map(|p| (p, "<|channel>".len()))
+                .or_else(|| text_buf.find("<channel>").map(|p| (p, "<channel>".len())));
+            if let Some((start_pos, tag_len)) = channel_start {
                 let before = text_buf[..start_pos].to_string();
                 if !before.trim().is_empty() {
                     let _ = tx.send(InferenceEvent::Token(before));
                 }
-                // Move remainder into thinking buffer.
-                thinking_buf = text_buf[start_pos + "<channel>".len()..].to_string();
+                thinking_buf = text_buf[start_pos + tag_len..].to_string();
                 text_buf.clear();
                 in_thinking = true;
             } else if text_buf.contains('<') && !text_buf.contains('>') {
@@ -336,7 +341,7 @@ fn process_request(
             } else {
                 // Check for tool call in full output.
                 if let Some(tool_call) = try_parse_tool_call(&full_output) {
-                    let pre = extract_pre_tool_text(&full_output);
+                    let _pre = extract_pre_tool_text(&full_output);
                     // Send any unsent text before tool call.
                     if !text_buf.trim().is_empty() && !text_buf.contains("<tool_call>") {
                         let _ = tx.send(InferenceEvent::Token(text_buf.clone()));
@@ -552,17 +557,51 @@ impl ChatRole {
 //   - ```json\n{"name": "...", "arguments": {...}}\n```
 
 fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
-    // Pattern 1: <tool_call>...</tool_call>
-    if let Some(start) = text.find("<tool_call>") {
-        if let Some(end) = text.find("</tool_call>") {
-            let json_str = &text[start + "<tool_call>".len()..end].trim();
-            return parse_tool_json(json_str);
-        }
-        // <tool_call> found but no closing tag yet -- check if the JSON inside is complete.
-        let after = &text[start + "<tool_call>".len()..];
-        let trimmed = after.trim();
-        if trimmed.ends_with('}') {
-            return parse_tool_json(trimmed);
+    // Find tool call opening tag: <tool_call>, <|tool_call>, or <|tool_call|>
+    let tc_start = text.find("<|tool_call>").map(|p| (p, "<|tool_call>".len()))
+        .or_else(|| text.find("<tool_call>").map(|p| (p, "<tool_call>".len())));
+
+    if let Some((start, tag_len)) = tc_start {
+        let after = &text[start + tag_len..];
+        // Find closing tag.
+        let end_pos = after.find("</tool_call>").map(|p| (p, "</tool_call>".len()))
+            .or_else(|| after.find("<tool_call|>").map(|p| (p, "<tool_call|>".len())))
+            .or_else(|| after.find("<|tool_call|>").map(|p| (p, "<|tool_call|>".len())))
+            .or_else(|| after.find("<eos>").map(|p| (p, "<eos>".len())));
+
+        let content = if let Some((end, _)) = end_pos {
+            after[..end].trim()
+        } else if after.trim().ends_with(')') || after.trim().ends_with('}') {
+            after.trim()
+        } else {
+            ""
+        };
+
+        if !content.is_empty() {
+            // Clean Gemma's special quote tokens: <|"|> -> "
+            let cleaned = content.replace("<|\"|>", "\"").replace("<|'|>", "'");
+            let cleaned = cleaned.trim();
+
+            // Gemma format: call:tool_name{key:value, ...}
+            if cleaned.starts_with("call:") {
+                let after_call = &cleaned["call:".len()..];
+                return parse_gemma_tool_call(after_call);
+            }
+
+            // Try as JSON.
+            if let Some(tc) = parse_tool_json(cleaned) {
+                return Some(tc);
+            }
+            // Try function-call syntax.
+            let known_tools = ["search_vault", "read_file", "list_files", "read_section"];
+            for tool_name in &known_tools {
+                if cleaned.starts_with(tool_name) {
+                    let fn_args = &cleaned[tool_name.len()..];
+                    if let Some(tc) = parse_function_call_syntax(tool_name, fn_args) {
+                        return Some(tc);
+                    }
+                }
+            }
         }
     }
 
@@ -613,7 +652,107 @@ fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
         }
     }
 
+    // Pattern 6: Gemma function-call syntax like:
+    //   search_vault(query:{"training_report"})
+    //   read_file(path:{"some/file.md"})
+    let known_tools = ["search_vault", "read_file", "list_files", "read_section"];
+    for tool_name in &known_tools {
+        if let Some(pos) = trimmed.find(tool_name) {
+            let after = &trimmed[pos + tool_name.len()..];
+            if after.starts_with('(') {
+                // Try to parse the function-call arguments.
+                if let Some(tc) = parse_function_call_syntax(tool_name, after) {
+                    return Some(tc);
+                }
+            }
+        }
+    }
+
     None
+}
+
+/// Parse Gemma 4 native tool call format: tool_name{key:"value", key2:"value2"}
+/// From traced output: call:search_vault{query:"training_report"}
+fn parse_gemma_tool_call(s: &str) -> Option<ToolCall> {
+    // Format: tool_name{key:value, ...}
+    let brace = s.find('{')?;
+    let name = s[..brace].trim().to_string();
+    let args_part = s[brace..].trim();
+
+    // Try parsing the {key:value} as JSON first (it's close to JSON).
+    // Add quotes around keys to make it valid JSON.
+    let json_attempt = args_part
+        .replace("{", "{\"")
+        .replace(":", "\":")
+        .replace(",", ",\"")
+        .replace("\"\"", "\""); // fix double quotes from the replacement
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_attempt) {
+        return Some(ToolCall {
+            id: format!("call_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis()).unwrap_or(0)),
+            name,
+            arguments: v,
+        });
+    }
+
+    // Manual parse: split on commas, then on first colon.
+    let inner = args_part.trim_start_matches('{').trim_end_matches('}');
+    let mut map = serde_json::Map::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if let Some(colon) = part.find(':') {
+            let key = part[..colon].trim().trim_matches('"');
+            let val = part[colon + 1..].trim().trim_matches('"');
+            map.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        }
+    }
+    if map.is_empty() { return None; }
+
+    Some(ToolCall {
+        id: format!("call_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis()).unwrap_or(0)),
+        name,
+        arguments: serde_json::Value::Object(map),
+    })
+}
+
+/// Parse Gemma-style function call: tool_name(key:{"value"}, key2:{"value2"})
+fn parse_function_call_syntax(name: &str, args_str: &str) -> Option<ToolCall> {
+    // Strip surrounding parens.
+    let inner = args_str.trim().strip_prefix('(')?.strip_suffix(')')
+        .or_else(|| {
+            // Handle case where closing paren is followed by more text.
+            let s = args_str.trim().strip_prefix('(')?;
+            s.rfind(')').map(|i| &s[..i])
+        })?;
+
+    // Parse key:{"value"} pairs or key:"value" pairs.
+    let mut map = serde_json::Map::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if let Some(colon) = part.find(':') {
+            let key = part[..colon].trim().trim_matches('"');
+            let val = part[colon + 1..].trim()
+                .trim_matches('{').trim_matches('}')
+                .trim_matches('"').trim_matches('\'');
+            map.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        }
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+
+    Some(ToolCall {
+        id: format!("call_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis()).unwrap_or(0)),
+        name: name.to_string(),
+        arguments: serde_json::Value::Object(map),
+    })
 }
 
 /// Find the position of the closing brace that matches the opening brace at position 0.
@@ -653,14 +792,14 @@ fn parse_tool_json(json_str: &str) -> Option<ToolCall> {
 }
 
 fn might_be_tool_call_start(text: &str) -> bool {
-    // Hold back flushing if we see partial markers that could be tag/tool call starts.
-    let tail = if text.len() > 30 { &text[text.len() - 30..] } else { text };
-    tail.contains("<tool_c")
-        || tail.contains("<functionc")
-        || tail.contains("<|python_t")
-        || tail.contains("<chann")
+    let tail = if text.len() > 40 { &text[text.len() - 40..] } else { text };
+    tail.contains("<tool")
+        || tail.contains("<func")
+        || tail.contains("<|python")
+        || tail.contains("<chan")
         || tail.ends_with('<')
-        || (tail.contains('<') && !tail.contains('>'))
+        || tail.ends_with("<|")
+        || (tail.rfind('<').is_some() && tail.rfind('<') > tail.rfind('>'))
 }
 
 fn extract_pre_tool_text(text: &str) -> String {
@@ -672,4 +811,245 @@ fn extract_pre_tool_text(text: &str) -> String {
     }
     // If it's a raw JSON tool call, return empty (the whole thing is the tool call).
     String::new()
+}
+
+// ── Anthropic API provider ──
+
+/// Auth method for Anthropic API.
+#[derive(Clone)]
+pub enum AnthropicAuth {
+    ApiKey(String),
+    OAuth, // uses auth::get_valid_token() for each request
+}
+
+/// Spawn a background thread that serves requests via the Anthropic Messages API.
+pub fn spawn_anthropic_thread(
+    auth: AnthropicAuth,
+    model: &str,
+) -> Result<InferenceHandle, String> {
+    let (tx, rx) = mpsc::channel::<InferenceRequest>();
+    let model = model.to_string();
+    let model_name = model.clone();
+
+    std::thread::Builder::new()
+        .name("forge-anthropic".into())
+        .spawn(move || {
+            eprintln!("[forge-api] Anthropic thread started, model: {model}");
+            for req in rx.iter() {
+                // Get auth header for each request (OAuth tokens may refresh).
+                let (header_name, header_value) = match &auth {
+                    AnthropicAuth::ApiKey(key) => ("x-api-key".to_string(), key.clone()),
+                    AnthropicAuth::OAuth => {
+                        match crate::auth::get_auth_header() {
+                            Ok(header) => header,
+                            Err(e) => {
+                                let _ = req.response_tx.send(InferenceEvent::Error(
+                                    format!("OAuth token error: {e}. Run login flow again.")
+                                ));
+                                let _ = req.response_tx.send(InferenceEvent::Done);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                anthropic_request(&header_name, &header_value, &model, &req);
+            }
+        })
+        .map_err(|e| format!("Failed to spawn Anthropic thread: {e}"))?;
+
+    Ok(InferenceHandle { tx, model_name })
+}
+
+fn anthropic_request(
+    auth_header: &str,
+    auth_value: &str,
+    model: &str,
+    req: &InferenceRequest,
+) {
+    let tx = &req.response_tx;
+
+    // Build request body.
+    let mut messages_json = Vec::new();
+    let mut system_prompt = String::new();
+
+    for msg in &req.messages {
+        match msg.role {
+            ChatRole::System => {
+                system_prompt = msg.content.clone();
+                continue;
+            }
+            ChatRole::User => {
+                messages_json.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.content
+                }));
+            }
+            ChatRole::Assistant => {
+                if !msg.tool_calls.is_empty() {
+                    let mut content = Vec::new();
+                    if !msg.content.is_empty() {
+                        content.push(serde_json::json!({"type": "text", "text": msg.content}));
+                    }
+                    for tc in &msg.tool_calls {
+                        content.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments
+                        }));
+                    }
+                    messages_json.push(serde_json::json!({"role": "assistant", "content": content}));
+                } else {
+                    messages_json.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": msg.content
+                    }));
+                }
+            }
+            ChatRole::Tool => {
+                messages_json.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                        "content": msg.content
+                    }]
+                }));
+            }
+        }
+    }
+
+    // Build tools array for the API.
+    let api_tools: Vec<serde_json::Value> = req.tools.iter().filter_map(|t| {
+        let func = t.get("function")?;
+        Some(serde_json::json!({
+            "name": func.get("name")?,
+            "description": func.get("description")?,
+            "input_schema": func.get("parameters")?
+        }))
+    }).collect();
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "stream": true,
+        "messages": messages_json
+    });
+
+    if !system_prompt.is_empty() {
+        body["system"] = serde_json::json!(system_prompt);
+    }
+    if !api_tools.is_empty() {
+        body["tools"] = serde_json::json!(api_tools);
+    }
+
+    // Make the streaming request.
+    let resp = match ureq::post("https://api.anthropic.com/v1/messages")
+        .set(auth_header, auth_value)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(InferenceEvent::Error(format!("API request failed: {e}")));
+            let _ = tx.send(InferenceEvent::Done);
+            return;
+        }
+    };
+
+    // Parse SSE stream.
+    let buf_reader = std::io::BufReader::new(resp.into_reader());
+
+    use std::io::BufRead;
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_json = String::new();
+    let mut in_tool_use = false;
+
+    for line in buf_reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if !line.starts_with("data: ") {
+            continue;
+        }
+        let data = &line["data: ".len()..];
+        if data == "[DONE]" {
+            break;
+        }
+
+        let event: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "content_block_start" => {
+                let block = event.get("content_block").unwrap_or(&serde_json::Value::Null);
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if block_type == "tool_use" {
+                    in_tool_use = true;
+                    current_tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    current_tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    current_tool_json.clear();
+                } else if block_type == "thinking" {
+                    // Extended thinking block starts.
+                }
+            }
+            "content_block_delta" => {
+                let delta = event.get("delta").unwrap_or(&serde_json::Value::Null);
+                let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match delta_type {
+                    "text_delta" => {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            let _ = tx.send(InferenceEvent::Token(text.to_string()));
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                            let _ = tx.send(InferenceEvent::Thinking(text.to_string()));
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(json) = delta.get("partial_json").and_then(|t| t.as_str()) {
+                            current_tool_json.push_str(json);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                if in_tool_use {
+                    let arguments: serde_json::Value = serde_json::from_str(&current_tool_json)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    let _ = tx.send(InferenceEvent::ToolUse(ToolCall {
+                        id: current_tool_id.clone(),
+                        name: current_tool_name.clone(),
+                        arguments,
+                    }));
+                    in_tool_use = false;
+                }
+            }
+            "message_stop" => {
+                break;
+            }
+            "error" => {
+                let msg = event.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown API error");
+                let _ = tx.send(InferenceEvent::Error(msg.to_string()));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = tx.send(InferenceEvent::Done);
 }

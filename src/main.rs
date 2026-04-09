@@ -2,6 +2,7 @@
 
 mod agent;
 mod app;
+mod auth;
 mod buffer;
 mod chat;
 mod editor;

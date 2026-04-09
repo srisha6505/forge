@@ -234,6 +234,7 @@ pub struct ForgeApp {
     chat_panel: Entity<ChatPanel>,
     chat_visible: bool,
     chat_drag: Option<f32>,
+    login_in_progress: bool,
     search_query: String,
     search_results: Vec<crate::search::SearchResult>,
     search_input: Entity<InputState>,
@@ -348,6 +349,7 @@ impl ForgeApp {
             chat_panel,
             chat_visible: false,
             chat_drag: None,
+            login_in_progress: false,
             search_query: String::new(),
             search_results: Vec::new(),
             search_input,
@@ -364,12 +366,7 @@ impl ForgeApp {
             app.push_vault_state_to_editor(cx);
 
             // Pass vault info to chat panel.
-            let db_path = dirs::config_dir().unwrap_or_default().join("forge").join("forge.db");
-            let vault_name = vp.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            app.chat_panel.update(cx, |panel, _cx| {
-                panel.set_vault(vp.clone(), db_path);
-                panel.set_system_prompt(&agent::default_system_prompt(&vault_name));
-            });
+            app.sync_chat_vault(cx);
 
             // Restore open tabs
             let tabs_to_open: Vec<PathBuf> = app.settings.open_tabs.iter()
@@ -403,6 +400,7 @@ impl ForgeApp {
                         a.editor.update(cx, |ed, _| ed.set_content(String::new()));
                         a.start_watcher(cx);
                         a.push_vault_state_to_editor(cx);
+                        a.sync_chat_vault(cx);
                         cx.notify();
                     }).ok();
                 }
@@ -425,6 +423,23 @@ impl ForgeApp {
             self.vault_search = Some(vs);
         }
 
+    }
+
+    /// Push vault path + db path to the chat panel so tools work.
+    fn sync_chat_vault(&self, cx: &mut Context<Self>) {
+        if let Some(vp) = &self.vault_path {
+            let db_path = dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("forge").join("forge.db");
+            let vault_name = vp.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let vp = vp.clone();
+            self.chat_panel.update(cx, |panel, _cx| {
+                panel.set_vault(vp, db_path);
+                panel.set_system_prompt(&agent::default_system_prompt(&vault_name));
+            });
+        }
     }
 
     fn refresh_file_tree(&mut self) {
@@ -864,33 +879,59 @@ impl ForgeApp {
         if self.chat_visible {
             w.focus(&self.chat_panel.read(cx).focus_handle(cx));
 
-            // Lazy-load inference on first open.
-            let needs_inference = self.chat_panel.read(cx).inference.is_none();
-            if needs_inference {
-                if let Some(model_path) = &self.settings.model_path {
-                    let path = model_path.clone();
-                    let gpu = self.settings.gpu_layers;
-                    let ctx_size = self.settings.ctx_size;
-                    let chat = self.chat_panel.clone();
-                    // Spawn model loading off the main thread so UI doesn't freeze.
-                    cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                        let result = llm::spawn_inference_thread(&path, gpu, ctx_size);
-                        match result {
-                            Ok(handle) => {
-                                eprintln!("[forge] Inference thread started: {}", handle.model_name);
-                                let _ = chat.update(cx, |panel, _cx| {
-                                    panel.set_inference(handle);
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("[forge] Failed to start inference: {e}");
-                            }
-                        }
-                    }).detach();
-                }
+            // Auto-connect if we have credentials and no inference yet.
+            if self.chat_panel.read(cx).inference.is_none() && !self.login_in_progress {
+                self.try_connect_inference(cx);
             }
         }
         cx.notify();
+    }
+
+    /// Try to connect inference from settings. Does NOT open browser.
+    fn try_connect_inference(&mut self, cx: &mut Context<Self>) {
+        let provider = &self.settings.ai_provider;
+
+        if provider == "anthropic" || provider == "claude" {
+            // Check for API key first, then stored OAuth tokens.
+            let auth = if let Some(key) = &self.settings.api_key {
+                Some(llm::AnthropicAuth::ApiKey(key.clone()))
+            } else if crate::auth::OAuthTokens::load().is_some() {
+                Some(llm::AnthropicAuth::OAuth)
+            } else {
+                None // No credentials -- chat panel will show connect UI.
+            };
+
+            if let Some(auth) = auth {
+                let model = &self.settings.api_model;
+                match llm::spawn_anthropic_thread(auth, model) {
+                    Ok(handle) => {
+                        eprintln!("[forge] Anthropic API ready: {}", handle.model_name);
+                        self.chat_panel.update(cx, |panel, _cx| {
+                            panel.set_inference(handle);
+                        });
+                    }
+                    Err(e) => eprintln!("[forge] Anthropic setup failed: {e}"),
+                }
+            }
+        } else if provider == "local" {
+            if let Some(path) = &self.settings.model_path {
+                let path = path.clone();
+                let gpu = self.settings.gpu_layers;
+                let ctx_size = self.settings.ctx_size;
+                let chat = self.chat_panel.clone();
+                cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    match llm::spawn_inference_thread(&path, gpu, ctx_size) {
+                        Ok(handle) => {
+                            eprintln!("[forge] Local model loaded: {}", handle.model_name);
+                            let _ = chat.update(cx, |panel, _cx| {
+                                panel.set_inference(handle);
+                            });
+                        }
+                        Err(e) => eprintln!("[forge] Failed to load model: {e}"),
+                    }
+                }).detach();
+            }
+        }
     }
 
     fn show_search(&mut self, _: &ShowSearch, w: &mut Window, cx: &mut Context<Self>) {

@@ -13,6 +13,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use crate::agent::{self, AgentEvent, ToolContext};
 use crate::llm::{ChatMessage, InferenceHandle};
 
+static PENDING_HANDLE: std::sync::Mutex<Option<InferenceHandle>> = std::sync::Mutex::new(None);
+
 // ── Events emitted to parent ──
 
 #[derive(Clone, Debug)]
@@ -154,6 +156,51 @@ impl ChatPanel {
         self.active_session = self.sessions.len() - 1;
     }
 
+    fn start_oauth_login(&mut self, cx: &mut Context<Self>) {
+        if self.inference.is_some() { return; }
+        let entity = cx.entity().clone();
+        // Run OAuth in background thread (blocks waiting for browser callback).
+        std::thread::Builder::new()
+            .name("forge-oauth".into())
+            .spawn(move || {
+                match crate::auth::login() {
+                    Ok(tokens) => {
+                        eprintln!("[forge] OAuth login successful! ({})",
+                            tokens.email.as_deref().unwrap_or("unknown"));
+                        // Now create inference handle.
+                        let auth = crate::llm::AnthropicAuth::OAuth;
+                        match crate::llm::spawn_anthropic_thread(auth, "claude-sonnet-4-6") {
+                            Ok(handle) => {
+                                // We can't update the entity from a raw thread.
+                                // Store a flag and handle on next poll.
+                                eprintln!("[forge] Anthropic thread ready: {}", handle.model_name);
+                                // Use a static channel as a simple IPC.
+                                if let Ok(mut guard) = PENDING_HANDLE.lock() {
+                                    *guard = Some(handle);
+                                }
+                            }
+                            Err(e) => eprintln!("[forge] Failed to start Anthropic: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[forge] OAuth login failed: {e}"),
+                }
+            })
+            .ok();
+        cx.notify();
+    }
+
+    /// Check if OAuth login completed in background.
+    fn check_pending_handle(&mut self, cx: &mut Context<Self>) {
+        if self.inference.is_none() {
+            if let Ok(mut guard) = PENDING_HANDLE.lock() {
+                if let Some(handle) = guard.take() {
+                    self.set_inference(handle);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn clear_session(&mut self, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.get_mut(self.active_session) {
             if !session.busy {
@@ -198,7 +245,7 @@ impl ChatPanel {
                 s.busy = false;
                 s.ui_messages.pop();
                 s.ui_messages.push(UiMessage::Error {
-                    message: "No model loaded. Set model_path in settings.".into(),
+                    message: "Not connected. Click 'Connect Claude' above or configure settings.".into(),
                 });
             }
             cx.notify();
@@ -363,6 +410,8 @@ impl ChatPanel {
         if let Some(s) = self.sessions.get_mut(self.active_session) {
             if let Some(UiMessage::Assistant { content, streaming: true, .. }) = s.ui_messages.last_mut() {
                 content.push_str(text);
+                // Safety net: strip any leaked thinking tags from displayed content.
+                strip_channel_tags(content);
             }
         }
     }
@@ -380,6 +429,9 @@ impl ChatPanel {
 
 impl Render for ChatPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Check if OAuth completed in background.
+        self.check_pending_handle(cx);
+
         let fg = cx.theme().foreground;
         let bg = cx.theme().background;
         let muted = cx.theme().muted_foreground;
@@ -445,21 +497,57 @@ impl Render for ChatPanel {
             .id("chat-messages")
             .flex().flex_col()
             .flex_1().min_h(px(0.)).min_w(px(0.))
-            .overflow_hidden()
+            .overflow_y_scroll().overflow_x_hidden()
             .track_scroll(&self.scroll)
             .px(px(10.)).py(px(8.)).gap(px(6.));
 
         if let Some(session) = self.sessions.get(self.active_session) {
             if session.ui_messages.is_empty() {
-                let hint = if self.inference.is_none() {
-                    "No model loaded -- set model_path in settings"
+                if self.inference.is_none() {
+                    msg_list = msg_list.child(
+                        div().flex_1().flex().flex_col().items_center().justify_center().gap(px(16.))
+                            .child(div().text_size(px(16.)).text_color(fg).font_weight(FontWeight::SEMIBOLD)
+                                .child("Forge Agent"))
+                            .child(div().text_size(px(12.)).text_color(muted).max_w(px(280.))
+                                .child("Add your provider in ~/.config/forge/settings.json:"))
+                            // Anthropic API key
+                            .child(
+                                div().flex().flex_col().gap(px(4.)).px(px(12.)).py(px(8.))
+                                    .rounded(px(6.)).bg(border.opacity(0.2)).max_w(px(320.))
+                                    .child(div().text_size(px(11.)).text_color(accent)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Claude API (recommended)"))
+                                    .child(div().text_size(px(10.)).text_color(muted)
+                                        .font_family("monospace")
+                                        .child("\"ai_provider\": \"anthropic\""))
+                                    .child(div().text_size(px(10.)).text_color(muted)
+                                        .font_family("monospace")
+                                        .child("\"api_key\": \"sk-ant-...\""))
+                                    .child(div().text_size(px(9.)).text_color(muted.opacity(0.5))
+                                        .child("Get key: console.anthropic.com/settings/keys"))
+                            )
+                            // Local model
+                            .child(
+                                div().flex().flex_col().gap(px(4.)).px(px(12.)).py(px(8.))
+                                    .rounded(px(6.)).bg(border.opacity(0.2)).max_w(px(320.))
+                                    .child(div().text_size(px(11.)).text_color(fg.opacity(0.7))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Local GGUF model"))
+                                    .child(div().text_size(px(10.)).text_color(muted)
+                                        .font_family("monospace")
+                                        .child("\"ai_provider\": \"local\""))
+                                    .child(div().text_size(px(10.)).text_color(muted)
+                                        .font_family("monospace")
+                                        .child("\"model_path\": \"/path/to/model.gguf\""))
+                            )
+                    );
                 } else {
-                    "Ask a question about your vault"
-                };
-                msg_list = msg_list.child(
-                    div().flex_1().flex().items_center().justify_center()
-                        .child(div().text_size(px(12.)).text_color(muted.opacity(0.5)).child(hint))
-                );
+                    msg_list = msg_list.child(
+                        div().flex_1().flex().items_center().justify_center()
+                            .child(div().text_size(px(12.)).text_color(muted.opacity(0.5))
+                                .child("Ask a question about your vault"))
+                    );
+                }
             }
 
             for (idx, msg) in session.ui_messages.iter().enumerate() {
@@ -757,7 +845,7 @@ fn render_code_block(lines: &[String], muted: Hsla, border: Hsla) -> Div {
 }
 
 /// Render a line of text with inline `code`, **bold**, and *italic* handling.
-fn inline(text: &str, fg: Hsla, muted: Hsla, accent: Hsla, border: Hsla) -> Div {
+fn inline(text: &str, fg: Hsla, _muted: Hsla, accent: Hsla, border: Hsla) -> Div {
     // Detect if the line contains inline code backticks.
     if text.contains('`') {
         let mut container = div().flex().flex_row().flex_wrap().gap(px(0.)).text_color(fg);
@@ -805,4 +893,39 @@ fn inline(text: &str, fg: Hsla, muted: Hsla, accent: Hsla, border: Hsla) -> Div 
 /// Strip **bold** and *italic* markers.
 fn strip_bold(text: &str) -> String {
     text.replace("**", "").replace("__", "")
+}
+
+/// Remove any thinking/tool tags that leaked into displayed text.
+fn strip_channel_tags(text: &mut String) {
+    // Strip complete <channel>...</channel|> blocks.
+    loop {
+        let start = match text.find("<channel>") {
+            Some(s) => s,
+            None => break,
+        };
+        // Find closing tag (multiple formats Gemma uses).
+        let end = text[start..].find("</channel>").map(|p| (start + p, "</channel>".len()))
+            .or_else(|| text[start..].find("<channel|>").map(|p| (start + p, "<channel|>".len())))
+            .or_else(|| text[start..].find("<|channel|>").map(|p| (start + p, "<|channel|>".len())));
+
+        if let Some((end_pos, tag_len)) = end {
+            let before = text[..start].to_string();
+            let after = text[end_pos + tag_len..].to_string();
+            *text = format!("{before}{after}");
+        } else {
+            // Incomplete -- truncate from <channel> onward.
+            text.truncate(start);
+            break;
+        }
+    }
+    // Strip leaked tool call tags.
+    if let Some(start) = text.find("<tool_call>") {
+        text.truncate(start);
+    }
+    // Clean up partial tags at the end.
+    if let Some(pos) = text.rfind('<') {
+        if pos > 0 && !text[pos..].contains('>') {
+            text.truncate(pos);
+        }
+    }
 }

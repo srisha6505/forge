@@ -45,6 +45,15 @@ pub struct Settings {
     /// Maximum tool-use iterations per agent turn.
     #[serde(default = "default_max_tool_iters")]
     pub max_tool_iterations: usize,
+    /// AI provider: "local" (GGUF) or "anthropic" (API).
+    #[serde(default = "default_provider")]
+    pub ai_provider: String,
+    /// Anthropic API key (for ai_provider = "anthropic").
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Anthropic model name.
+    #[serde(default = "default_api_model")]
+    pub api_model: String,
 }
 
 pub fn default_body_font() -> String { "DejaVu Sans".to_string() }
@@ -56,6 +65,8 @@ pub fn default_gpu_layers() -> u32 { 99 }
 pub fn default_ctx_size() -> u32 { 8192 }
 pub fn default_chat_width() -> f32 { 400.0 }
 pub fn default_max_tool_iters() -> usize { 10 }
+pub fn default_provider() -> String { "local".into() }
+pub fn default_api_model() -> String { "claude-sonnet-4-6".into() }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -74,6 +85,9 @@ impl Default for Settings {
             ctx_size: default_ctx_size(),
             chat_panel_width: default_chat_width(),
             max_tool_iterations: default_max_tool_iters(),
+            ai_provider: default_provider(),
+            api_key: None,
+            api_model: default_api_model(),
         }
     }
 }
