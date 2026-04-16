@@ -1,6 +1,7 @@
 # Rust
 target/
 src-tauri/target/
+src-tauri/gen/
 # Bundled native libs at the workspace root only (NOT src/lib, which is React).
 /lib/
 *.AppImage
