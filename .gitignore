@@ -1,5 +1,23 @@
+# Rust
 target/
+src-tauri/target/
 lib/
 *.AppImage
 Forge.AppDir/
+
+# Models
 *.gguf
+
+# Node
+node_modules/
+dist/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Legacy GPUI layout, kept alongside during migration
+src-old/
+Cargo.toml.old
+Cargo.lock.old
