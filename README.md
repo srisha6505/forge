@@ -90,38 +90,68 @@ npm run tauri dev
 3. Click a note in the sidebar to open it
 4. Start editing
 
-### Setting up the AI agent
+## Models
 
-Forge runs AI models locally using [llama.cpp](https://github.com/ggerganov/llama.cpp). No API keys, no internet, your data stays on your machine.
+Forge depends on two models:
 
-1. Download a GGUF model:
+1. **LLM** — drives the chat agent. You download a GGUF file once and point Forge at it.
+2. **Embedding model** — powers vector search. Auto-downloaded by the search backend the first time you run a search.
+
+### 1. LLM (chat agent)
+
+Forge runs LLMs locally via [llama.cpp](https://github.com/ggerganov/llama.cpp) (vendored as `llama-cpp-2`, Vulkan-accelerated). Any GGUF-format model works. No API keys, no internet, your data stays on your machine.
+
+**Recommended location:** `~/.forge/models/<model-name>/<file>.gguf`. Forge doesn't enforce this — `model_path` in settings can point anywhere on disk.
+
+**Recommended models:**
+
+| Model | Size | VRAM | Quality | Speed | Best for |
+|---|---|---|---|---|---|
+| [Gemma 4 E4B Q4_K_M](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) | 5 GB | 6 GB | Good | Fast | General use |
+| [Qwen 2.5 7B Q4_K_M](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) | 4.5 GB | 6 GB | Strong tool use | Fast | Agentic tool calling |
+| [Gemma 4 26B-A4B IQ4_XS](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | ~10 GB | 12 GB | High | Fast (MoE) | Best quality under 12 GB |
+| [Llama 3.2 3B Q4_K_M](https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF) | 2 GB | 3 GB | Decent | Fastest | Low-end hardware / CPU only |
+
+**Download:**
 
 ```bash
-# Gemma 4 E4B (recommended for ≤12GB VRAM)
 pip install huggingface_hub
+
+# Pick one of the recommended models above. Example: Gemma 4 E4B
 hf download unsloth/gemma-4-E4B-it-GGUF \
     --local-dir ~/.forge/models/gemma-4-E4B \
     --include "*Q4_K_M*"
 ```
 
-2. Add the model path to `~/.config/forge/settings.json`:
+After download you should have a `.gguf` file under `~/.forge/models/gemma-4-E4B/`.
+
+**Configure** in `~/.config/forge/settings.json`:
 
 ```json
 {
+    "ai_provider": "local",
     "model_path": "/home/you/.forge/models/gemma-4-E4B/gemma-4-E4B-it-Q4_K_M.gguf",
     "gpu_layers": 99,
     "ctx_size": 8192,
-    "ai_provider": "local"
+    "max_tool_iterations": 10
 }
 ```
 
-3. Click the message-bubble icon in the left rail or press **Ctrl+Shift+L** to toggle the chat panel
-4. Click **Connect** in the chat panel header
-5. Ask questions — the agent searches your notes via the vault search tool
+| Setting | What it does |
+|---|---|
+| `model_path` | Absolute path to the `.gguf` file. **Required.** |
+| `gpu_layers` | `99` = all layers on GPU (fastest). `0` = CPU only. Partial value (e.g. `26`) for models that don't fit fully in VRAM. |
+| `ctx_size` | Token context window. `8192` is comfortable for chat; `32768` if you want long-doc summarisation, but uses more VRAM. |
+| `max_tool_iterations` | Cap on how many tool calls the agent makes per user message. `10` is a sane default. |
 
-#### Anthropic API alternative
+**Activate:**
 
-If you'd rather use Anthropic's hosted models:
+1. Open Forge
+2. Toggle the chat panel: **Ctrl+Shift+L** (or click the message-bubble icon in the left rail)
+3. Click **Connect** in the chat panel header — first connect loads the model into VRAM (a few seconds for small models, up to a minute for 26B)
+4. Ask a question — the agent uses `search_vault`, `read_file`, `write_file`, `web_search`, etc.
+
+**Anthropic API alternative.** If you'd rather use a hosted model:
 
 ```json
 {
@@ -130,6 +160,40 @@ If you'd rather use Anthropic's hosted models:
     "api_model": "claude-sonnet-4-6"
 }
 ```
+
+The agent loop and tool set are identical — the only thing that changes is which inference backend serves the requests.
+
+### 2. Embedding model (vector search)
+
+Forge uses [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) for vector search. 384-dim, ~90 MB, runs on CPU via the `candle` Rust ML framework.
+
+**You don't have to download anything manually.** The search backend (`embedder.rs`) calls `hf_hub::api::sync::Api` on first use, which downloads the model into the standard HuggingFace cache:
+
+| Platform | Cache location |
+|---|---|
+| Linux | `~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/` |
+| macOS | `~/Library/Caches/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/` |
+| Windows | `%LOCALAPPDATA%\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\` |
+
+**First search will be slow** (download + load: 30s-2min depending on connection). Subsequent searches load from cache (~500ms). The search index itself is built once into `~/.config/forge/search.db` (SQLite FTS5) + `~/.config/forge/search.usearch` (vector index) and reused across runs.
+
+**Pre-warm the cache** if you want to avoid the first-search delay:
+
+```bash
+# Optional — only if you want the model cached before opening Forge
+hf download sentence-transformers/all-MiniLM-L6-v2 \
+    --include "tokenizer.json" "model.safetensors" "config.json"
+```
+
+This downloads to `~/.cache/huggingface/hub/` automatically.
+
+**Triggering the index build.**
+
+- **From the chat agent**: ask any question that hits the `search_vault` tool. The first call lazy-builds the index from your current vault.
+- **From the search panel**: open the sidebar Search tab and type a query — same lazy-build happens.
+- **Explicit rebuild**: open the **Ctrl+Shift+F** modal and click the refresh icon in the footer ("Reindex"). Useful when you've edited many files outside Forge and the index is stale.
+
+**No internet?** If `hf_hub` can't reach huggingface.co (offline / firewall), the embedder fails to initialise. The search backend automatically falls back to **BM25-only** mode — keyword search still works. Vector / semantic search returns nothing until the embedder loads. Look for `BM25 only` in the search panel header to confirm the fallback is active.
 
 ## Keyboard Shortcuts
 
@@ -247,15 +311,6 @@ All settings live in `~/.config/forge/settings.json`:
     "api_model": "claude-sonnet-4-6"
 }
 ```
-
-## Recommended models
-
-| Model | Size | VRAM | Quality | Speed | Notes |
-|---|---|---|---|---|---|
-| Gemma 4 E4B Q4_K_M | 5 GB | 6 GB | Good | Fast | Default recommendation |
-| Qwen 2.5 7B Q4_K_M | 4.5 GB | 6 GB | Strong tool calling | Fast | Best for agentic tool use |
-| Gemma 4 26B-A4B IQ4_XS | ~10 GB | 12 GB | High | Fast (MoE) | Best quality under 12 GB |
-| Llama 3.2 3B Q4_K_M | 2 GB | 3 GB | Decent | Fastest | Low-end hardware |
 
 ## Theme compatibility
 
