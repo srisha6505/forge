@@ -1,349 +1,510 @@
 # Forge Codebase Index
 
-Quick reference for finding where things live. Update this file whenever files/types/functions change.
+Living map of the project. Update when files, types, commands, or IPC events change.
 
 ## Project
 
-A pure-Rust, GPU-accelerated markdown editor built on GPUI (Zed's rendering engine). Reads Obsidian-style vaults.
+**Forge** — Tauri 2 + React + TypeScript markdown editor with an embedded AI research agent.
+Frontend is React/CodeMirror 6. Backend is Rust, wired to the frontend via Tauri commands.
+The app talks to either a local GGUF model (`llama-cpp-2` + Vulkan) or the Anthropic API.
 
-## Architecture (bottom-up)
+## Architecture
 
 ```
-┌────────────────────────────────────────┐
-│ app.rs — ForgeApp: window, sidebar,    │
-│          tabs, file management         │
-├────────────────────────────────────────┤
-│ editor.rs — Editor: GPUI component,    │
-│             rendering, cursor, input   │
-├────────────────────────────────────────┤
-│ buffer.rs — Buffer: rope text buffer,  │
-│             cursor, selection, undo    │
-├────────────────────────────────────────┤
-│ markdown.rs — Parser: pulldown-cmark   │
-│               → per-line block info    │
-│ settings.rs — Persistent config        │
-│ theme.rs    — Design tokens            │
-│ icons.rs    — Inline div-drawn icons   │
-└────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  React UI  (src/)                                        │
+│  App.tsx ── LeftRail, Sidebar, Editor, Chat, Resize      │
+│     │                                                    │
+│     │ invoke(...) / listen("chat://...")                 │
+│     ▼                                                    │
+├──────────────────────────────────────────────────────────┤
+│  Tauri bridge  (src/lib/tauri.ts)                        │
+│  Typed wrappers around invoke + event listeners          │
+│     │                                                    │
+│     │ IPC                                                │
+│     ▼                                                    │
+├──────────────────────────────────────────────────────────┤
+│  Rust backend  (src-tauri/src/)                          │
+│  lib.rs  ── AppState, Tauri builder, handler registry    │
+│  commands.rs ── Tauri command handlers                   │
+│  settings.rs ── persisted ~/.config/forge/settings.json  │
+│  llm.rs    ── llama-cpp-2 inference thread + Anthropic   │
+│  agent.rs  ── agent loop, tool execution, system prompt  │
+│  search.rs ── vault embedding + vector search            │
+│  embedder.rs ── local embeddings via candle              │
+│  auth.rs   ── Anthropic OAuth (unused by current UI)     │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## File Index
+## Frontend Index (React / TypeScript)
 
-### `src/main.rs` (11 lines)
-Entry point. Declares modules, calls `app::run_app()`.
-
-**Modules declared:** `app`, `buffer`, `editor`, `graph`, `icons`, `links`, `markdown`, `settings`, `theme`
+### `src/main.tsx` (10 lines)
+Entry point. Mounts `<App/>` into `#root` with React StrictMode.
 
 ---
 
-### `src/buffer.rs` (694 lines)
-**Pure data layer.** Rope-based text buffer, cursor, selection, undo/redo.
-No GPUI dependencies. All text editing logic lives here.
+### `src/App.tsx` (171 lines)
+Top-level shell. Holds vault/tree/active-file/sidebar/chat state in local `useState` and
+assembles the four-pane layout: `[LeftRail] [Sidebar?] [Editor] [Chat?]`.
 
-**Key types:**
-- `Buffer` — text buffer backed by `ropey::Rope`. Owns selection + undo stack.
-- `Selection { anchor, head }` — two byte offsets, can be empty (cursor) or range.
+**State:**
+- `vault: string | null`, `tree: TreeNode | null`
+- `activePath: string | null`, `activeContent: string`
+- `activeTab: "files" | "search" | "chat" | "settings"`
+- `sidebarVisible`, `chatVisible`, `sidebarWidth`, `chatWidth`
+- Bounds: `MIN_SIDEBAR=180`, `MAX_SIDEBAR=480`, `MIN_CHAT=280`, `MAX_CHAT=640`
 
-**Buffer API (where to look for editing operations):**
-
-| Category | Methods |
-|---|---|
-| **Accessors** | `rope()`, `text()`, `len_bytes()`, `len_lines()`, `line_str(i)`, `line_to_byte(l)`, `byte_to_line(b)`, `selection()`, `cursor()`, `is_dirty()` |
-| **Cursor movement** | `move_left()`, `move_right()`, `move_up()`, `move_down()`, `move_home()`, `move_end()`, `move_word_left()`, `move_word_right()` |
-| **Selection** | `select_left()`, `select_right()`, `select_up()`, `select_down()`, `select_word_left()`, `select_word_right()`, `select_home()`, `select_end()`, `select_all()`, `select_word_at()`, `select_line_at()` |
-| **Editing** | `insert(text)`, `backspace()`, `delete()`, `backspace_word()`, `delete_word()`, `enter()`, `indent()`, `dedent()`, `duplicate_line()`, `toggle_wrap(marker)`, `insert_at_line_start(prefix)` |
-| **History** | `undo()`, `redo()` |
-| **Clipboard** | `selected_text()` |
-
-**Internal:**
-- `Edit { offset, deleted, inserted }` — single reversible edit
-- `EditGroup` — groups of edits that undo together (grouped by 300ms timeout)
+**Behaviour:**
+- On mount → `currentVault()` + `listVaultTree()` to restore last vault
+- `pickVault()` → Tauri dialog `open({directory:true})` → `openVault()` → reload tree
+- `openFile(path)` → `readFile()` → sets `activePath` + `activeContent`
+- `saveActive(content)` → `writeFile()` on each change (no debounce yet)
+- `handleRailChange(tab)` → toggles sidebar when clicking current tab, otherwise switches
 
 ---
 
-### `src/editor.rs` (1854 lines)
-**GPUI rendering layer.** This is the big one. Renders the Buffer, handles keyboard/mouse, parses markdown inline styling.
-
-**Key types:**
-- `Editor` — GPUI entity wrapping a Buffer. Holds render state.
-- `EditorElement` — custom GPUI Element that paints the editor.
-- `DisplayLine` — one content line's rendering: display_text + TextRuns + display↔content mapping
-- `RenderItem` — enum: `Line(RenderLine)` or `Table(RenderTable)` — hybrid rendering items
-- `RenderLine` — a single line with wrapped text, display line, y-origin, height
-- `RenderTable` — a table widget: rows, col_x, col_widths, y-origin, total_height
-- `RenderTableRow` — one row: cells, kind (Header/Separator/Data), y_in_table, height
-- `RenderCell` — one cell: lines (Vec<ShapedLine>), col index
-- `TableRowKind` — enum: NotTable, Header, Separator, Data
-- `EditorPrepaint` — state passed from prepaint to paint
-
-**Sections of the file:**
-
-| Line range | Contents |
-|---|---|
-| 1-12 | Imports + LINE_HEIGHT (22px) + SCROLL_LINES (3.0) constants |
-| 14-42 | Actions: all editor actions (movement, selection, editing, formatting, inserts) |
-| 44-135 | `Editor` struct + `new()` + cursor blink timer + set_content + reparse |
-| 137-345 | Action handler methods (`on_move_left`, `on_backspace`, `on_toggle_bold`, etc.) - make `pub` so `app.rs` can forward |
-| 347-425 | EntityInputHandler impl (OS keyboard input → buffer edits) |
-| 427-495 | TableRowKind + RenderItem + RenderLine + RenderTable + RenderTableRow + RenderCell |
-| 497-570 | DisplayLine struct + build_display_line() entry point |
-| 572-830 | `build_display_line` logic: empty line / table / raw mode / HR / stripped mode + list bullet/checkbox injection |
-| 832-920 | `process_list_item_display` (currently unused — list handling is inline in stripped path) |
-| 922-1060 | `wrap_at_word_boundaries`, `slice_runs`, `build_cell_inline` (pulldown-cmark parse inline markers) |
-| 1062-1170 | `cell_effective_length`, `build_table_render` (computes col widths, wraps cells) |
-| 1172-1260 | `build_table_runs`, `build_text_runs_raw/display/inner` (per-byte style runs) |
-| 1262-1310 | `parse_table_cells`, `is_table_separator`, `pad_table_line` (legacy, for active-table raw rendering) |
-| 1312-1395 | `EditorElement` + `EditorPrepaint` struct |
-| 1397-1570 | `EditorElement::prepaint` — builds RenderItems, cursor, selections |
-| 1572-1780 | `EditorElement::paint` — draws decorations (code blocks), selections, RenderItems (Line + Table), cursor |
-| 1782-1854 | `impl Render for Editor` — wires up div + actions + mouse handlers |
-
-**Where to edit specific features:**
-
-| Feature | Location |
-|---|---|
-| Add a new editor action | `actions!` macro (~line 15), add `on_xxx` method (~line 137+), register in render impl (~line 1800), bind key in `app.rs` `bind_keys` |
-| Change inline markdown styling (bold, italic, code, links) | `build_text_runs_inner` (~line 1220) |
-| Change heading sizes | `build_display_line`'s font_size match (~line 550) |
-| Change list bullet/checkbox chars | `build_display_line` list_replacement logic (~line 610) |
-| Change table colors/borders/styling | `EditorElement::paint` table rendering (~line 1680) |
-| Change table column width distribution | `build_table_render` col_widths computation (~line 1100) |
-| Change cell wrapping | `wrap_at_word_boundaries` (~line 940) |
-| Change cursor appearance/blinking | cursor paint in prepaint (~line 1500) + blink timer in Editor::new (~line 55) |
-| Change selection highlight | selection paint in prepaint (~line 1520) |
+### `src/components/LeftRail.tsx` (66 lines)
+Vertical 48px icon rail. Four buttons: Files, Search, Chat, Settings.
+- Files / Search / Settings → switch sidebar `activeTab`
+- Chat → calls `onToggleChat` (right panel, not sidebar)
+- Active tab gets `bg-[var(--bg-hover)] text-[var(--text-accent)]`
+- Inline SVG icons (no asset files)
 
 ---
 
-### `src/markdown.rs` (394 lines)
-**Markdown parser.** Wraps `pulldown-cmark` to produce per-line annotations.
+### `src/components/Sidebar.tsx` (112 lines)
+Left panel showing the vault file tree. Markdown files only.
+
+**Components:**
+- `Sidebar` — header with vault name + "Open" button, scrollable file list
+- `TreeNodeView` — recursive node. Depth 0 folders open by default. `.md`/`.mdx` extensions hidden from display
+
+**Props:** `vaultName`, `tree: TreeNode`, `activePath`, `onPickVault`, `onOpenFile`
+
+**Where to edit things:**
+- Change what files show → this component + `commands::build_tree` backend filter
+- Add context menu → new handler in `TreeNodeView`
+- Change indent / hover styles → button classNames
+
+---
+
+### `src/components/Editor.tsx` (54 lines)
+CodeMirror 6 markdown editor.
+- `@uiw/react-codemirror` wrapper
+- `markdown({ base: markdownLanguage, codeLanguages: languages })`
+- `EditorView.lineWrapping`
+- Custom theme + highlight from `lib/cm-theme.ts`
+- Empty state when `path === null`
+- Header strip shows full path; floating bottom-right label shows file basename
+
+**Shortcomings / edit points:**
+- No debouncing on `onChange` → hits `writeFile` every keystroke
+- No status bar, no word count, no save indicator
+
+---
+
+### `src/components/Chat.tsx` (273 lines)
+Right-side chat panel. Talks to `llm.rs` via Tauri events.
 
 **Key types:**
-- `BlockType` — enum: Paragraph, Heading(1-6), ListItem, CodeBlock, BlockQuote, HorizontalRule, Table, MathBlock (`$$...$$`), ImageEmbed (whole-line `![[img.png]]` or `![alt](url)`)
-- `BlockInfo { block_type, prefix_len }` — which block a line belongs to + syntax prefix length
-- `SpanStyle` — enum: Bold, Italic, BoldItalic, InlineCode, Strikethrough, Link
-- `InlineSpan { range, style }` — byte range within line
-- `WikiLink { range, target, heading, alias }` — `[[Target]]`, `[[Target|alias]]`, `[[Target#heading]]`
-- `LineInfo { block, spans, wikilinks }` — per-line annotations
+```ts
+type UiMessage =
+  | { kind: "user"; content: string }
+  | { kind: "assistant"; content: string; streaming: boolean }
+  | { kind: "tool"; name: string; args: string; result?: string; isError?: boolean }
+  | { kind: "error"; message: string };
+```
+
+**State:** `messages`, `input`, `busy`, `modelLabel`, `connected`
+
+**IPC lifecycle:**
+1. User clicks **Connect** → `connectInference()` → sets `modelLabel` + `connected`
+2. User hits **Send** / Enter → `sendChatMessage(history)` (fire-and-forget)
+3. Streaming events arrive:
+   - `chat://token` → appended to last assistant bubble (creates one if missing)
+   - `chat://tool-start` → pushes a `tool` UiMessage (`running…`)
+   - `chat://tool-result` → walks backward to match unfulfilled tool by name, sets `result` + `isError`
+   - `chat://done` → marks last assistant bubble as non-streaming; `busy=false`
+   - `chat://error` → appends error; `busy=false`
+
+**Rendering:**
+- `MessageBlock` dispatches by `kind`
+- User → right-aligned bubble (`bg-accent`, max 85% width)
+- Assistant → full-width `prose-chat` with `ReactMarkdown` (remark-gfm + rehype-highlight)
+- Tool → single line: `tool <name> <summary> <status>` with accent left border
+- `summariseArgs(name, argsJson)` — per-tool one-line preview (query for search, path for read_file, etc.)
+
+**Current bugs / rough edges:**
+- Tool-result matching is loose (`name + no result yet`) — two parallel calls of same tool will mismatch
+- No copy button on messages yet
+- `modelLabel` only reflects the last `connect()` — no reconnect on settings change
+- No abort / stop button
+
+---
+
+### `src/components/ResizeHandle.tsx` (66 lines)
+3px vertical drag strip. `onMouseDown` captures pointer, emits `onResize(delta)` on each
+`mousemove`, releases on `mouseup`. Parent clamps.
+- `side: "left" | "right"` prop exists but unused
+- Body cursor set to `col-resize` during drag
+
+---
+
+### `src/lib/tauri.ts` (122 lines)
+Typed invoke wrappers + event listeners. **Single source of truth for the React↔Rust contract.**
+
+**Types:**
+- `VaultEntry { name, path, is_dir }`
+- `TreeNode { name, path, is_dir, children }`
+- `Settings { ... }` — full settings shape mirroring `src-tauri/src/settings.rs`
+- `ChatTurn { role: "user"|"assistant", content }`
+- `ConnectResult { model_name }`
+- `ToolStartPayload { name, args }`, `ToolResultPayload { name, content, is_error }`
+- `SearchHit { path, title, snippet, score }`
+
+**Commands (invoke):**
+
+| Category | Exports |
+|---|---|
+| Settings | `getSettings`, `setSettings` |
+| Vault | `currentVault`, `openVault`, `listVaultFiles`, `listVaultTree` |
+| Files | `readFile`, `writeFile`, `renameFile`, `deleteFile` |
+| Search | `searchVault` (stub, returns []) |
+| Inference | `connectInference`, `sendChatMessage`, `stopChat` |
+
+**Chat events (listen):**
+
+| Event | Payload | Handler |
+|---|---|---|
+| `chat://token` | `string` | `onChatToken` |
+| `chat://thinking` | `string` | `onChatThinking` |
+| `chat://tool-start` | `ToolStartPayload` | `onChatToolStart` |
+| `chat://tool-result` | `ToolResultPayload` | `onChatToolResult` |
+| `chat://done` | `void` | `onChatDone` |
+| `chat://error` | `string` | `onChatError` |
+
+---
+
+### `src/lib/cm-theme.ts` (84 lines)
+CodeMirror 6 theme + `HighlightStyle` using the warm-dark palette from `index.css`.
+- `forgeTheme` — editor colours, caret, selection, hidden gutters
+- `forgeMarkdownHighlight` — heading sizes, strong/em, monospace, links, list markers
+- Export: `forgeMarkdownExtensions = [forgeTheme, syntaxHighlighting(forgeMarkdownHighlight)]`
+
+---
+
+### `src/index.css` (301 lines)
+Tailwind base + custom palette + two prose sheets.
+
+**CSS custom properties (`:root`):**
+
+| Group | Variables |
+|---|---|
+| Backgrounds | `--bg-base`, `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-hover`, `--bg-active`, `--bg-modal` |
+| Borders | `--border-subtle`, `--border`, `--border-strong` |
+| Text | `--text-normal`, `--text-muted`, `--text-faint`, `--text-accent`, `--text-on-accent` |
+| Accents | `--accent`, `--accent-hover`, `--accent-soft` |
+| Semantic | `--error`, `--success` |
+
+**Prose sheets:**
+- `.prose-chat` (lines 82-192) — react-markdown output in the chat panel
+- `.cm-editor` token styles (lines 194-301) — `tok-heading`, `tok-strong`, `tok-emphasis`, `tok-inlineCode`, `tok-link`, `tok-list` etc.
+
+---
+
+## Backend Index (Rust / Tauri)
+
+### `src-tauri/src/main.rs` (6 lines)
+Thin wrapper: `fn main() { forge_lib::run(); }`
+
+---
+
+### `src-tauri/src/lib.rs` (61 lines)
+Tauri builder + `AppState`.
+
+**AppState:**
+```rust
+pub struct AppState {
+    pub inference: Mutex<Option<llm::InferenceHandle>>,
+    pub settings: Mutex<settings::Settings>,
+    pub vault_path: Mutex<Option<PathBuf>>,
+}
+```
+
+**Registered commands** (13): `get_settings`, `set_settings`, `open_vault`, `current_vault`,
+`list_vault_files`, `list_vault_tree`, `read_file`, `write_file`, `rename_file`, `delete_file`,
+`search_vault`, `connect_inference`, `send_chat_message`, `stop_chat`.
+
+**Plugins:** `tauri-plugin-dialog`, `tauri-plugin-fs`, `tauri-plugin-shell`.
+
+---
+
+### `src-tauri/src/commands.rs` (433 lines)
+Tauri command handlers. Every `#[tauri::command]` takes `State<'_, AppState>` and returns
+`Result<T, String>` so the frontend gets stringified errors.
+
+**Types:** `VaultEntry`, `TreeNode`, `SearchHit`, `ConnectResult`, `ChatTurn`.
+
+**Commands by section:**
+
+| Lines | Section | Commands |
+|---|---|---|
+| 16-27 | Settings | `get_settings`, `set_settings` |
+| 46-173 | Vault | `current_vault`, `open_vault`, `list_vault_tree` + `build_tree`, `list_vault_files` |
+| 177-247 | File IO | `read_file`, `write_file`, `rename_file`, `delete_file` (all `resolve_within_vault`-guarded) |
+| 259-268 | Search | `search_vault` (stub) |
+| 277-303 | Inference | `connect_inference` (local or Anthropic based on `ai_provider`) |
+| 315-409 | Chat | `send_chat_message` (spawns `forge-agent` thread) + `forward_agent_event` + `stop_chat` (noop) |
+| 414-432 | Helpers | `resolve_within_vault` (canonicalize + prefix check) |
+
+**Chat plumbing:** `send_chat_message` builds `Vec<ChatMessage>`, prepends system prompt from
+`agent::default_system_prompt(vault_name)`, spawns a thread which:
+1. Creates a fresh mpsc channel
+2. Spawns a nested thread running `agent::run_agent_loop`
+3. Drains events and forwards each as `window.emit("chat://...")`
+4. Breaks on `Finished` or `Error`
+
+---
+
+### `src-tauri/src/settings.rs` (144 lines)
+Persisted config in `~/.config/forge/settings.json`.
+
+**Struct fields** (all `#[serde(default)]`):
+`last_vault_path`, `theme`, `open_tabs`, `active_tab`, `body_font`, `interface_font`,
+`mono_font`, `font_size`, `sidebar_width`, `model_path`, `gpu_layers`, `ctx_size`,
+`chat_panel_width`, `max_tool_iterations`, `ai_provider`, `api_key`, `api_model`.
+
+**Defaults:**
+- Fonts: `DejaVu Sans` (body + interface), `DejaVu Sans Mono` (mono), `15.0` px
+- Sidebar: `260.0` px, Chat: `400.0` px
+- Inference: `gpu_layers = 99`, `ctx_size = 8192`, `max_tool_iterations = 10`
+- Provider: `"local"`, API fallback model: `"claude-sonnet-4-6"`
+
+**Methods:** `load()`, `save()`, `resolved_vault_path()`, `set_vault(path)`.
+
+**Constants:** `BODY_FONTS`, `MONO_FONTS` — curated family lists for a future settings UI.
+
+---
+
+### `src-tauri/src/llm.rs` (1429 lines)
+Inference backend — both local GGUF and Anthropic API.
+
+**Public types:**
+- `ChatRole` — System | User | Assistant | Tool
+- `ToolCall { id, name, arguments: serde_json::Value }`
+- `ChatMessage { role, content, tool_calls, tool_call_id }` with constructors `system` / `user` / `assistant` / `assistant_with_tool_calls` / `tool_result`
+- `InferenceRequest { messages, tools, response_tx }`
+- `InferenceEvent` — Token | Thinking | ToolUse | Done | Error
+- `InferenceHandle { tx, model_name }` with `generate(messages, tools) -> Receiver<InferenceEvent>`
+- `AnthropicAuth` — ApiKey | OAuth
 
 **Public functions:**
-- `parse_lines(text, line_starts) -> Vec<LineInfo>` — main parser entry point (also scans wikilinks, math blocks, image embeds)
-- `block_range(n_lines, cursor_line, is_blank, line_info) -> (start, end)` — find block containing cursor
-- `marker_lens(style) -> (prefix_bytes, suffix_bytes)` — how many bytes to strip per span style
-- `parse_image_embed(trimmed) -> Option<String>` — extract path/target from a whole-line image embed
+- `spawn_inference_thread(model_path, n_gpu_layers, n_ctx) -> Result<InferenceHandle, String>` — starts llama-cpp-2 thread with Vulkan
+- `spawn_anthropic_thread(auth, model) -> Result<InferenceHandle, String>` — mimics the same channel interface against the HTTP API
 
-**Tests:** heading, bold, list, inline_code, code_block, table(s), wikilink_simple, wikilink_with_alias, wikilink_with_heading, wikilink_heading_and_alias, wikilink_multiple, wikilink_ignored_in_inline_code, wikilink_ignored_in_code_block, wikilink_empty_target_skipped, wikilink_unclosed_skipped
+**Pipeline (local, line ranges approx):**
 
----
-
-### `src/graph.rs` (~310 lines)
-**Graph view.** Renders a force-free circular node-edge graph built from the LinkIndex.
-
-**Key types:**
-- `GraphView` — GPUI entity; holds nodes, edges, pan, zoom, hover state
-- `GraphNode { path, label, x, y, radius }` — one note, with layout + size (scales with degree)
-- `GraphEvent::OpenNote(PathBuf)` — emitted when user clicks a node
-- `GraphElement` — custom Element that paints: bg quad, edges (stroked paths), nodes (rounded quads), labels (ShapedLine)
-
-**API:**
-- `GraphView::new(cx)` — empty graph
-- `set_data(&LinkIndex)` — rebuild nodes + edges + circular layout
-- `render_graph(&Entity<GraphView>, cx)` — wraps GraphView in mouse/scroll handlers, node/edge count HUD
-
-**Interaction:**
-- Drag background: pan. Scroll wheel: zoom (0.2–3.0). Click node: emits `OpenNote` → ForgeApp switches to Files panel and opens tab.
-
----
-
-### `src/links.rs` (~290 lines)
-**Wikilink index.** Resolves `[[Target]]` to file paths + tracks backlinks across the vault.
-
-**Key types:**
-- `LinkIndex` — main struct; holds `name_to_paths`, `outgoing`, `backlinks` hashmaps
-- `LinkRef { source, line, context, target }` — one wikilink occurrence
-
-**API:**
-- `LinkIndex::scan_vault(root) -> Self` — walk all `.md` files, parse wikilinks, build index
-- `update_file(path, content)` — incremental update on save / file change
-- `remove_file(path)` — drop a file from the index
-- `resolve(target) -> Option<&Path>` — case-insensitive basename → path (shortest path on collision)
-- `exists(target) -> bool`
-- `backlinks_for_path(path) -> Vec<&LinkRef>` — all places linking to `path`
-
-**Tests:** resolve_basic, resolve_collision_prefers_shortest_path, reindex_builds_backlinks, reindex_replaces_previous_entries, remove_file_clears_index, self_links_excluded_from_backlinks
-
----
-
-### `src/app.rs` (909 lines)
-**Application shell.** Window, sidebar, file tree, tabs, vault management, keybindings.
-
-**Key types:**
-- `ForgeApp` — main app entity
-- `FileTreeEntry` — enum: File { name, path } or Folder { name, path, children }
-- `Tab { path, name }` — one open tab
-
-**Public functions:**
-- `run_app()` — creates window, binds keys, opens editor (line ~690+)
-
-**ForgeApp fields:**
-- `vault_path`, `vault_name`, `files`, `file_tree`, `tabs`, `active_tab`, `editor: Entity<Editor>`, `sidebar_visible`, `collapsed_folders`, `settings`, `title_input`, `renaming_title`, `readable_width`, `_watcher` (file notify), `link_index: LinkIndex`, `backlinks_visible: bool`
-
-**Methods grouped:**
-
-| Category | Methods |
+| Lines | What |
 |---|---|
-| **Vault** | `open_folder`, `load_vault_sync`, `refresh_file_tree`, `refresh_vault`, `start_watcher` |
-| **Tabs** | `open_path_as_tab`, `switch_to_tab`, `load_active_tab`, `close_tab_at`, `close_current_tab`, `next_tab`, `prev_tab`, `persist_tabs` |
-| **Files** | `save`, `new_file`, `delete_file`, `start_rename`, `commit_rename` |
-| **Toggles** | `toggle_theme`, `toggle_sidebar`, `toggle_readable_width`, `toggle_read_mode` |
-| **Editor action forwarders** | `fwd_cut`, `fwd_copy`, `fwd_paste`, `fwd_select_all`, `fwd_undo`, `fwd_bold`, `fwd_italic`, etc. — so context menu actions reach the editor |
-| **Render** | `render_file_tree`, `impl Render for ForgeApp` (builds sidebar + tabs + content + status bar) |
-
-**Where to edit specific features:**
-
-| Feature | Location |
-|---|---|
-| Add a keybinding | `run_app` → `cx.bind_keys([...])` (~line 770) |
-| Add a context menu item | `context_menu` closure in Render impl (~line 640) |
-| Change sidebar layout | `render_file_tree` + sidebar construction in Render impl (~line 480) |
-| Change tab bar | Tab bar construction in Render impl (~line 560) |
-| Change topbar | Topbar construction in Render impl (~line 590) |
-| Change status bar | Status bar construction in Render impl (~line 680) |
-
-**Actions defined:** OpenFolder, Save, Quit, ToggleTheme, ToggleSidebar, NewFile, DeleteFile, CloseTab, NextTab, PrevTab, RefreshVault, ToggleReadableWidth, ToggleBacklinks, ShowFiles, ShowGraph, ShowSettings
-
-**SidePanel enum:** `Files | Graph | Settings`. Narrow 44px icon rail on far left switches between: file tree + editor (Files), graph view (Graph), settings pane (Settings). Search icon present but inactive.
+| 107-140 | `spawn_inference_thread` — model load + thread spawn |
+| 141-202 | `inference_loop` — owns `LlamaContext`, pulls from request channel |
+| 203-413 | `process_request` — tokenise, sample, stream tokens, parse tool calls |
+| 414-479 | `format_prompt` — Gemma chat template |
+| 480-557 | `format_prompt_with_injected_tools` — injects tool list into system turn |
+| 572-706 | `try_parse_tool_call` — full parser dispatch |
+| 707-728 | `parse_gemma_tool_call` — `call:name{k:v,...}` native format |
+| 729-751 | `parse_function_call_syntax` — `name(k=v, ...)` fallback |
+| 752-894 | `parse_kv_anchored` + `find_key_anchor` + `clean_anchored_value` — position-anchored parser that survives unescaped quotes in values |
+| 915-1102 | `parse_kv_map` + `parse_kv_value` — classical recursive-descent fallback |
+| 1118-1152 | `find_json_end`, `parse_tool_json` — JSON tool-call fallback |
+| 1153-1192 | `might_be_tool_call_start`, `extract_pre_tool_text`, `strip_tool_markers` — streaming splitter that keeps pre-call text and hides the call tag from the UI |
+| 1194-1429 | Anthropic backend: `AnthropicAuth`, `spawn_anthropic_thread`, `anthropic_request` |
 
 ---
 
-### `src/settings.rs` (65 lines)
-**Persistent config** stored in `~/.config/forge/settings.json`.
+### `src-tauri/src/agent.rs` (1262 lines)
+Agent loop and tool execution.
 
-**Fields:**
-- `last_vault_path`, `theme`, `open_tabs`, `active_tab`
+**Types:**
+- `AgentEvent` — Token | Thinking | ToolCallStarted | ToolCallResult | Finished{messages} | Error
+- `ToolContext { vault_path, db_path }`
+- `ToolResult { content, is_error }`
 
-**Methods:**
-- `load()` — read from disk
-- `save()` — write to disk
-- `resolved_vault_path()` — last vault or fallback (`/home/code/Production/sfa/research`)
-- `set_vault(path)` — switch vault, clear tabs, save
+**Public API:**
+- `tool_schemas() -> Vec<serde_json::Value>` (line 114) — JSON schema for all 10 tools (passed to model)
+- `execute_tool(tool_call, ctx) -> ToolResult` (line 325) — dispatches to `exec_*`
+- `default_system_prompt(vault_name) -> String` (line 1104) — instructs the model to chain tools, prefer search, never guess paths
+- `run_agent_loop(inference, messages, tools, ctx, max_iters, event_tx)` (line 1124) — blocking loop that streams tokens, executes tools, appends assistant+tool messages, breaks on Finished/Error or 2× consecutive same-call failures
 
----
+**Tool executors (line → fn):**
 
-### `src/theme.rs` (37 lines)
-**Design tokens.** Change values here to restyle the app.
+| Line | Tool | Purpose |
+|---|---|---|
+| 344 | `exec_search_vault` | SQLite FTS search over vault chunks |
+| 432 | `exec_read_file` | `fs::read_to_string`, vault-scoped |
+| 459 | `exec_list_files` | `fs::read_dir`, `.md` only |
+| 514 | `exec_read_section` | Reads a heading chunk from a file |
+| 580 | `exec_write_file` | Create/overwrite with aggressive field aliases (`path`/`file`/`filename`/…) + filename rescue |
+| 684 | `exec_edit_file` | Replace `old_text` → `new_text` in a file |
+| 747 | `exec_rename_file` | Move inside vault |
+| 798 | `exec_delete_file` | Delete inside vault |
+| 820 | `exec_web_search` | DuckDuckGo HTML scraper (parses `<a class="result__a">` up to `</a>`) |
+| 919 | `exec_grep_vault` | Recursive regex search across `.md` files |
 
-**Constants:**
-- Font sizes: `FONT_EDITOR`, `FONT_UI`, `FONT_SM`, `FONT_TINY`, `FONT_TITLE`, `FONT_EMPTY_STATE`
-- Sidebar: `SIDEBAR_WIDTH`, `SIDEBAR_HEADER_HEIGHT`, `SIDEBAR_ITEM_HEIGHT`, `SIDEBAR_INDENT_PER_LEVEL`, `SIDEBAR_PADDING_LEFT`
-- Tabs: `TAB_BAR_HEIGHT`, `TAB_MAX_WIDTH`
-- Status bar: `STATUSBAR_HEIGHT`
-- Content: `CONTENT_MAX_WIDTH`, `CONTENT_PADDING_X`, `CONTENT_PADDING_X_WIDE`, `CONTENT_PADDING_TOP`, `TITLE_PADDING_BOTTOM`
-- Radii: `RADIUS_SM`, `RADIUS_MD`, `RADIUS_LG`
+**Helpers:** `validate_vault_path`, `urlencoded`, `urldecoded`, `extract_between`, `strip_html_tags`.
 
----
-
-### `src/icons.rs` (120 lines)
-**Inline icon shapes** built from GPUI divs (no SVG assets).
-
-**Public items:**
-- `ICON_W`, `ICON_H` — size constants
-- `file_icon(color)` — document with 3 lines inside
-- `folder_icon(color)` — tab + body
-- `image_icon(color)` — rect with sun dot + mountain
-- `pdf_icon(color)` — document with colored bar at bottom
-- `code_icon(color)` — `{}` in rectangle
-- `icon_for_path(path, color)` — dispatcher based on file extension
-- `chevron_right_char()`, `chevron_down_char()`, `close_char()` — unicode string helpers
-
-**Extensions mapped:** `.md`→file, `.png/.jpg/.gif/.webp/.svg`→image, `.pdf`→pdf, `.rs/.py/.js/.ts/.go/.java/.cpp` etc.→code
+**Loop-break guard:** `last_call_sig` + `consecutive_failures`. If the same failing tool call
+fires twice with identical args, the loop emits an Error + Finished and returns. Prevents
+infinite loops on a parse-bug model.
 
 ---
 
-## Keybindings Reference
+### `src-tauri/src/search.rs` (458 lines)
+Vault embedding + vector search. **Not yet wired into `search_vault` command** (stub returns []).
 
-### App level (ForgeApp context)
-| Key | Action |
-|---|---|
-| Ctrl+O | Open folder |
-| Ctrl+S | Save |
-| Ctrl+Q | Quit |
-| Ctrl+N | New file |
-| Ctrl+W | Close tab |
-| Ctrl+Tab / Ctrl+Shift+Tab | Next/Prev tab |
-| Ctrl+Shift+T | Toggle theme |
-| Ctrl+B | Toggle sidebar |
-| Ctrl+Shift+R | Toggle readable width |
-| Ctrl+R / F5 | Refresh vault |
-| Ctrl+E | Toggle read mode |
-| Ctrl+Shift+B | Toggle backlinks panel |
-
-### Editor context
-| Key | Action |
-|---|---|
-| Arrow keys | Move cursor |
-| Home/End | Line start/end |
-| Ctrl+Left/Right | Word move |
-| Shift+arrows | Extend selection |
-| Ctrl+Shift+Left/Right | Word select |
-| Shift+Home/End | Select to line start/end |
-| Ctrl+A | Select all |
-| Ctrl+L | Select current line |
-| Backspace / Delete | Delete |
-| Ctrl+Backspace / Ctrl+Delete | Delete word |
-| Enter | Smart enter (continues lists) |
-| Tab / Shift+Tab | Indent/Dedent |
-| Ctrl+C / X / V | Copy/Cut/Paste |
-| Ctrl+Z / Ctrl+Y | Undo/Redo |
-| Ctrl+Shift+D | Duplicate line |
-| Ctrl+B | Bold (wrap with `**`) |
-| Ctrl+I | Italic |
-| Ctrl+Shift+C | Inline code |
-| Ctrl+Shift+S | Strikethrough |
-| Up/Down | (autocomplete open) navigate list |
-| Enter / Tab | (autocomplete open) insert selected wikilink |
-| Esc | (autocomplete open) close popup |
+- `Chunk { id, path, title, heading, text, start, end }`
+- `SearchResult { chunk, score }`
+- `VaultSearch` — sqlite DB + `usearch` index
+- `collect_md_files(root)`, `chunk_file(content)` — chunker splits by heading boundaries
 
 ---
 
-## Dependencies (Cargo.toml)
+### `src-tauri/src/embedder.rs` (67 lines)
+Local embeddings via `candle-transformers`. Wraps a model loaded through `hf-hub`.
+`LocalEmbedder` holds the model + tokenizer and exposes `embed(text) -> Vec<f32>`.
 
+---
+
+### `src-tauri/src/auth.rs` (428 lines)
+Anthropic OAuth PKCE flow + API key creation. **Not currently invoked by the UI.**
+`login()` runs a local callback server, exchanges the code, calls `create_api_key(access_token)`.
+`get_auth_header()` returns `(header_name, header_value)` for either OAuth or classic API key.
+
+---
+
+## Tauri Config
+
+### `src-tauri/Cargo.toml` (40 lines)
 | Crate | Purpose |
 |---|---|
-| `gpui = "0.2.2"` | Zed's GPU-accelerated UI framework |
-| `gpui-component = "0.5"` | UI components (Input, PopupMenu, ContextMenu), themes |
-| `ropey = "1.6"` | Rope text buffer |
-| `pulldown-cmark = "0.12"` | Markdown parser |
-| `notify = "7"` | File system watcher (external changes to vault) |
-| `serde`, `serde_json` | Settings serialization |
-| `dirs = "5"` | Platform config directory (~/.config/forge) |
-| `unicode-segmentation = "1.12"` | Grapheme-aware text ops |
+| `tauri = "2"` + plugins `dialog`, `fs`, `shell` | Shell, plugins |
+| `serde`, `serde_json` | IPC serialisation |
+| `dirs = "5"` | Config dir |
+| `rusqlite = "0.31"` (bundled) | Vault search DB |
+| `usearch = "2"` | Vector index |
+| `ureq = "2"` (json) | HTTP for Anthropic + DuckDuckGo + OAuth |
+| `openssl = "0.10"` (vendored) | TLS |
+| `candle-core` / `candle-nn` / `candle-transformers = "0.8"` | Local embeddings |
+| `hf-hub = "0.5"`, `tokenizers = "0.20"` | Model + tokenizer downloads |
+| `notify = "7"` | Filesystem watcher (not wired yet) |
+| `llama-cpp-2 = "0.1"` (feature `vulkan`) | Local GGUF inference |
+
+### `package.json` (40 lines)
+**Runtime:** `react 18`, `@tauri-apps/api 2`, `@uiw/react-codemirror`, `@codemirror/lang-markdown`,
+`@codemirror/state`, `@codemirror/view`, `@codemirror/language-data`, `react-markdown 9`,
+`remark-gfm 4`, `rehype-highlight 7`.
+**Dev:** `@tauri-apps/cli 2`, `vite 6`, `typescript 5.7`, `tailwindcss 3`, `highlight.js 11`.
+
+### `src-tauri/tauri.conf.json`
+Tauri window / bundle config (title, default size, bundle identifier). Review before release.
 
 ---
 
-## How to add X
+## IPC Contract Reference
 
-### Add a new editor action
-1. Add variant to `actions!` macro in `editor.rs`
-2. Add `pub fn on_xxx(&mut self, _: &Xxx, w: &mut Window, cx: &mut Context<Self>)` handler
-3. Register with `.on_action(cx.listener(Self::on_xxx))` in `impl Render for Editor`
-4. Add keybinding in `app.rs` `cx.bind_keys([...])`
-5. (Optional) Add forwarder on ForgeApp so context menu can dispatch it
+### Invoke commands
 
-### Add a new block type render
-1. Add variant to `RenderItem` enum in `editor.rs`
-2. Detect in prepaint loop, build item, add to `items` Vec
-3. Paint it in the paint loop match
+| TS export | Rust handler | Args | Returns |
+|---|---|---|---|
+| `getSettings()` | `get_settings` | — | `Settings` |
+| `setSettings(s)` | `set_settings` | `new: Settings` | `void` |
+| `currentVault()` | `current_vault` | — | `string \| null` |
+| `openVault(path)` | `open_vault` | `path: string` | `VaultEntry[]` |
+| `listVaultFiles(subPath?)` | `list_vault_files` | `subPath?: string` | `VaultEntry[]` |
+| `listVaultTree()` | `list_vault_tree` | — | `TreeNode` |
+| `readFile(path)` | `read_file` | `path: string` | `string` |
+| `writeFile(path, content)` | `write_file` | `path, content: string` | `void` |
+| `renameFile(from, to)` | `rename_file` | `from, to: string` | `void` |
+| `deleteFile(path)` | `delete_file` | `path: string` | `void` |
+| `searchVault(query, limit?)` | `search_vault` | `query: string, limit?: number` | `SearchHit[]` (stub) |
+| `connectInference()` | `connect_inference` | — | `ConnectResult` |
+| `sendChatMessage(history)` | `send_chat_message` | `history: ChatTurn[]` | `void` (events fire on `chat://*`) |
+| `stopChat()` | `stop_chat` | — | `void` (noop) |
 
-### Change colors/styling
-- Design tokens: `src/theme.rs`
-- Editor text colors: hardcoded at top of `EditorElement::prepaint`
-- Editor decoration colors: hardcoded at top of `EditorElement::paint`
-- Theme colors: use `cx.theme().foreground`, `cx.theme().accent`, etc. from `gpui-component`
+### Chat events (backend → frontend)
 
-### Change the default vault
-`src/settings.rs` → `Settings::default_test_vault()`
+| Event | Payload |
+|---|---|
+| `chat://token` | `string` |
+| `chat://thinking` | `string` |
+| `chat://tool-start` | `{ name, args }` |
+| `chat://tool-result` | `{ name, content, is_error }` |
+| `chat://done` | `void` |
+| `chat://error` | `string` |
 
-### Add a file type with its own icon
-`src/icons.rs` → `icon_for_path()` match arm
+---
+
+## Known gaps / obvious improvement targets
+
+Use this as a worklist when the user says "make things better."
+
+**Editor (`Editor.tsx`, `cm-theme.ts`):**
+- No save debounce → every keystroke hits Tauri `writeFile`. Add `useDebouncedCallback` around `saveActive`.
+- No dirty indicator, word count, or save status.
+- CodeMirror theme does not implement Obsidian-style "live preview" (syntax markers stay visible at all times).
+- No image preview, no embed rendering, no wikilink resolution.
+
+**Sidebar (`Sidebar.tsx`):**
+- Only `.md`/`.markdown` files are shown (enforced in backend `build_tree`). No folders-with-non-md, no images.
+- No right-click context menu (new, rename, delete).
+- No drag-and-drop re-order.
+- Empty folders are dropped by `build_tree` (line 104), which surprises users.
+
+**Chat (`Chat.tsx`):**
+- Tool-result → tool-call matching walks by `name`, so parallel calls of the same tool get misaligned.
+- No abort button; `stopChat` is a noop backend-side.
+- No copy-to-clipboard on assistant messages.
+- `connect()` label never updates when the user changes settings.
+- No persistence — messages vanish on reload.
+- No token count / cost readout.
+
+**LeftRail / global:**
+- Search, Chat (sidebar pane), Settings panes all say "coming soon."
+- No keybindings yet (no `ctrl+s`, `ctrl+o`, `ctrl+p`).
+- No command palette.
+
+**Backend:**
+- `search_vault` command is a stub (`Ok(vec![])`). Need to adapt `search.rs` to the Tauri state shape.
+- `stop_chat` is a noop — needs cooperative cancellation.
+- `list_vault_tree` drops empty folders (`commands.rs:104`) — fix if users want empty folders visible.
+- `notify` crate is listed but no filesystem watcher is wired up → external file changes are invisible to the UI.
+
+---
+
+## How to add X (frontend)
+
+### Add a new Tauri command
+1. Write the Rust handler in `src-tauri/src/commands.rs`
+2. Register it in `src-tauri/src/lib.rs` `tauri::generate_handler![...]`
+3. Add a typed wrapper in `src/lib/tauri.ts`
+4. Call it from a component via the typed wrapper (never raw `invoke`)
+
+### Add a new chat event
+1. Emit with `window.emit("chat://xxx", payload)` inside `forward_agent_event` (or directly)
+2. Type the payload + wrapper in `src/lib/tauri.ts` (`onChatXxx`)
+3. Handle it in `Chat.tsx`'s `useEffect` subscription list
+
+### Change the palette
+Edit `:root` CSS variables in `src/index.css`. All components read them via `var(--...)`.
+
+### Add a new sidebar pane
+1. Extend the `activeTab` union type in `App.tsx` (+ `LeftRail.tsx` props)
+2. Add an icon button in `LeftRail.tsx`
+3. Add a `{activeTab === "new" && (...)}` branch in `App.tsx`'s sidebar block
+
+### Add a component-level keybinding
+Currently none exist. The pattern will be:
+- Global: `useEffect` on `window.addEventListener("keydown", ...)` in `App.tsx`
+- Editor-local: CodeMirror `keymap.of([...])` extension in `cm-theme.ts`
