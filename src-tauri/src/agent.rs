@@ -332,6 +332,20 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
 // ── Tool execution ──
 
 pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+    // Sanitize: if value is literally the word "thought" (model leaking),
+    // blank it out so list_files/directory="" lists root, etc.
+    let mut sanitized = tool_call.clone();
+    if let Some(obj) = sanitized.arguments.as_object_mut() {
+        for (_key, val) in obj.iter_mut() {
+            if let Some(s) = val.as_str() {
+                let trimmed = s.trim();
+                if trimmed == "thought" || trimmed == "Thought" {
+                    *val = serde_json::Value::String(String::new());
+                }
+            }
+        }
+    }
+    let tool_call = &sanitized;
     match tool_call.name.as_str() {
         "search_vault" => exec_search_vault(tool_call, ctx),
         "read_file" => exec_read_file(tool_call, ctx),
@@ -362,37 +376,46 @@ fn exec_search_vault(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
         return ToolResult { content: "Empty search query".into(), is_error: true };
     }
 
-    // Lazy-init the shared VaultSearch if it hasn't been opened yet.
-    // The same instance is shared with the search panel via Arc<Mutex>>.
-    let mut guard = match ctx.search.lock() {
-        Ok(g) => g,
-        Err(_) => return ToolResult {
-            content: "Search index lock poisoned".into(),
-            is_error: true,
-        },
+    // Check if init needed without holding the lock long.
+    let needs_init = {
+        let guard = ctx.search.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_none()
     };
-    if guard.is_none() {
-        match crate::search::VaultSearch::new(&ctx.search_db_path, &ctx.search_index_path) {
-            Ok(mut vs) => {
-                if vs.chunk_count() == 0 {
-                    if let Err(e) = vs.build_vault(&ctx.vault_path) {
-                        return ToolResult {
-                            content: format!("Failed to build vault index: {e}"),
-                            is_error: true,
-                        };
-                    }
-                    let _ = vs.save_index(&ctx.search_index_path);
-                }
+
+    // Build VaultSearch OUTSIDE the mutex. Prevents deadlock with concurrent
+    // reindex/search calls and stops a build panic from poisoning the lock.
+    if needs_init {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut vs = crate::search::VaultSearch::new(&ctx.search_db_path, &ctx.search_index_path)
+                .map_err(|e| format!("open index: {e}"))?;
+            if vs.chunk_count() == 0 {
+                vs.build_vault(&ctx.vault_path)
+                    .map_err(|e| format!("build vault: {e}"))?;
+                let _ = vs.save_index(&ctx.search_index_path);
+            }
+            Ok::<_, String>(vs)
+        }));
+        match built {
+            Ok(Ok(vs)) => {
+                let mut guard = ctx.search.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(vs);
             }
-            Err(e) => return ToolResult {
-                content: format!("Failed to open search index: {e}"),
+            Ok(Err(e)) => return ToolResult { content: e, is_error: true },
+            Err(_) => return ToolResult {
+                content: "Search init panicked".into(),
                 is_error: true,
             },
         }
     }
 
-    let vs = guard.as_ref().unwrap();
+    let guard = ctx.search.lock().unwrap_or_else(|e| e.into_inner());
+    let vs = match guard.as_ref() {
+        Some(vs) => vs,
+        None => return ToolResult {
+            content: "Search not available".into(),
+            is_error: true,
+        },
+    };
     let results = match vs.search(query, limit) {
         Ok(r) => r,
         Err(e) => return ToolResult {
@@ -443,9 +466,17 @@ fn exec_read_file(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
 
     match fs::read_to_string(&full_path) {
         Ok(content) => {
-            // Truncate very large files.
-            let truncated = if content.len() > 800 {
-                format!("{}...\n\n[truncated, {} bytes total]", &content[..800], content.len())
+            const MAX_CHARS: usize = 60_000;
+            let truncated = if content.chars().count() > MAX_CHARS {
+                let mut end = 0usize;
+                for (i, _) in content.char_indices().take(MAX_CHARS) {
+                    end = i;
+                }
+                format!(
+                    "{}…\n\n[truncated at {MAX_CHARS} chars; {} bytes total]",
+                    &content[..end],
+                    content.len()
+                )
             } else {
                 content
             };
@@ -855,6 +886,7 @@ fn exec_web_search(tc: &ToolCall) -> ToolResult {
 
     let response = match ureq::get(&url)
         .set("User-Agent", "Mozilla/5.0 (compatible; ForgeAgent/0.1)")
+        .timeout(std::time::Duration::from_secs(15))
         .call()
     {
         Ok(r) => r,
@@ -997,6 +1029,13 @@ fn exec_grep_vault(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
                 }
             }
 
+            // Skip large files — reading 100MB+ as string explodes memory.
+            const MAX_GREP_BYTES: u64 = 2_000_000;
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.len() > MAX_GREP_BYTES {
+                    continue;
+                }
+            }
             // Read file and search for pattern.
             let content = match fs::read_to_string(&path) {
                 Ok(c) => c,
@@ -1124,20 +1163,54 @@ fn strip_html_tags(s: &str) -> String {
 
 /// Default system prompt for the research agent.
 pub fn default_system_prompt(vault_name: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Simple YYYY-MM-DD from unix timestamp (UTC).
+    let days = now / 86400;
+    let (year, month, day) = {
+        let mut d = days as i64 + 719468;
+        let era = if d >= 0 { d } else { d - 146096 } / 146097;
+        let doe = (d - era * 146097) as u64;
+        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365*yoe + yoe/4 - yoe/100);
+        let mp = (5*doy + 2) / 153;
+        let day = (doy - (153*mp + 2)/5 + 1) as u32;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let year = if month <= 2 { y + 1 } else { y };
+        (year, month, day)
+    };
     format!(
-        "You are a research assistant for the vault \"{vault_name}\".\n\
+        "You are a research assistant for the Obsidian-style vault \"{vault_name}\".\n\
          \n\
-         You CAN and SHOULD call multiple tools in one turn. After each tool result you see, decide if you need more information or another action. Do not stop after one tool call if the task is not fully done. Chain calls: e.g. list_files then read_file, or search_vault then web_search for broader context.\n\
+         STATE:\n\
+         - Today's date: {year:04}-{month:02}-{day:02}\n\
+         - Vault name: {vault_name}\n\
+         - Your files live INSIDE this vault. You do NOT know what is in the vault until you call list_files or search_vault.\n\
          \n\
-         When in doubt, SEARCH. Prefer web_search over guessing. Citing a source beats hallucinating.\n\
-         Use vault tools (search_vault, read_file, list_files, read_section, grep_vault) for anything about the user's notes.\n\
-         Use write_file/edit_file/rename_file/delete_file when the user asks to create or modify notes.\n\
-         Only answer from memory when the question is basic and you are fully confident, or when it is a follow-up that references the prior conversation.\n\
+         CRITICAL: NEVER invent or hallucinate file names. Always call list_files or search_vault first to see the REAL files. If the tool returns a list, USE that exact list — do not substitute made-up names like \"pasta_carbonara.md\" or \"stoicism.md\". Those are NOT in the vault unless the tool returned them.\n\
          \n\
-         TOOL CALL FORMAT: when writing files, the 'path' argument MUST be a plain string like \"notes/my_file.md\" and 'content' MUST be a plain string. Never omit 'path'.\n\
-         If a read_file call misses, do NOT guess path variations. Call list_files once and match against the real file names.\n\
+         NEVER output your thinking process. No \"thought\" blocks. No narration. Just act.\n\
          \n\
-         Be concise. Cite file names for vault results and URLs for web results."
+         WORKFLOW:\n\
+         - User asks \"what's in my vault?\" → call list_files with directory:\"\" (empty string = root) → report the actual results.\n\
+         - User asks to write a note → call web_search if needed → call write_file with valid path + content.\n\
+         - User asks about a specific topic → call search_vault → read_file for details → answer.\n\
+         \n\
+         TOOL RULES:\n\
+         1. Tool arguments = DATA ONLY. Never put reasoning/thinking in arguments.\n\
+         2. list_files: directory arg should be \"\" (empty) for root, or a subfolder name. Never put thinking there.\n\
+         3. Search queries: 3-8 keywords. Example: \"Iran US Strait Hormuz 2025\"\n\
+         4. NEVER repeat the same tool call with identical arguments.\n\
+         5. write_file: REQUIRED fields are 'path' (e.g. \"notes/topic.md\") AND 'content'. Path must end in .md.\n\
+         6. After tool results, USE the results. Do not ignore them and hallucinate.\n\
+         \n\
+         RESPONSE RULES:\n\
+         - Report what the tool actually returned. If list_files returned files A, B, C — say A, B, C.\n\
+         - Cite actual file paths, not invented ones.\n\
+         - Be concise. Synthesize, don't dump raw results."
     )
 }
 
@@ -1157,6 +1230,7 @@ pub fn run_agent_loop(
     // retrying the same failing call.
     let mut last_call_sig: Option<String> = None;
     let mut consecutive_failures = 0usize;
+    let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         if iterations >= max_iterations {
@@ -1188,18 +1262,40 @@ pub fn run_agent_loop(
                 Ok(InferenceEvent::ToolUse(tc)) => {
                     let args_str = serde_json::to_string_pretty(&tc.arguments)
                         .unwrap_or_default();
+                    let call_sig = format!("{}::{}", tc.name, args_str);
+
+                    // Dedup: if same name+args already called, feed error back
+                    // to the model so it generates different output (not skip silently).
+                    if seen_calls.contains(&call_sig) {
+                        let _ = event_tx.send(AgentEvent::ToolCallResult {
+                            name: tc.name.clone(),
+                            content: "Already called with same arguments. Use a different query or proceed to synthesize an answer.".into(),
+                            is_error: true,
+                        });
+                        let preamble = std::mem::take(&mut accumulated_text);
+                        messages.push(ChatMessage::assistant_with_tool_calls(
+                            preamble,
+                            vec![tc.clone()],
+                        ));
+                        messages.push(ChatMessage::tool_result(
+                            &tc.id,
+                            "Error: duplicate tool call. Try different query or write the answer.".to_string(),
+                        ));
+                        got_tool_use = true;
+                        continue;
+                    }
+                    seen_calls.insert(call_sig.clone());
+
                     let _ = event_tx.send(AgentEvent::ToolCallStarted {
                         name: tc.name.clone(),
                         args: args_str.clone(),
                     });
 
                     // Execute the tool.
+                    eprintln!("[forge-agent] executing tool: {} args={}", tc.name, args_str);
                     let result = execute_tool(&tc, ctx);
+                    eprintln!("[forge-agent] tool {} done, is_error={}, content_len={}", tc.name, result.is_error, result.content.len());
 
-                    // Loop-break guard: if the same tool call fails twice in
-                    // a row, stop and return the error. Otherwise a broken
-                    // parse could spin until max_iterations.
-                    let call_sig = format!("{}::{}", tc.name, args_str);
                     if result.is_error {
                         if last_call_sig.as_deref() == Some(&call_sig) {
                             consecutive_failures += 1;
@@ -1219,8 +1315,11 @@ pub fn run_agent_loop(
                     });
 
                     // Append assistant message with tool call + tool result to history.
+                    // Drain accumulated_text so subsequent tool calls in the
+                    // same turn don't re-push the same prose text.
+                    let preamble = std::mem::take(&mut accumulated_text);
                     messages.push(ChatMessage::assistant_with_tool_calls(
-                        accumulated_text.clone(),
+                        preamble,
                         vec![tc.clone()],
                     ));
                     messages.push(ChatMessage::tool_result(
