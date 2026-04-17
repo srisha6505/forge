@@ -24,7 +24,7 @@ serde_json = "1"
 # Backend deps preserved from the GPUI version
 dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
-usearch = "2"
+usearch = { version = "2", default-features = false, features = ["fp16lib"] }
 ureq = { version = "2", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
 candle-core = "0.8"
@@ -33,7 +33,13 @@ candle-transformers = "0.8"
 hf-hub = "0.5"
 tokenizers = "0.20"
 notify = "7"
-llama-cpp-2 = { version = "0.1", features = ["vulkan"] }
+llama-cpp-2 = { version = "0.1", features = ["cuda"] }
+hound = "3"
+cpal = "0.15"
+rand = "0.8"
+byteorder = "1"
+webrtc-vad = "0.4"
+base64 = "0.22"
 
 [features]
 # Re-export tauri custom-protocol when building production bundle
