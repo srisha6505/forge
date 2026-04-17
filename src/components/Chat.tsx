@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { VoiceInput } from "./VoiceInput";
+import { ConversationToggle } from "./ConversationToggle";
 import {
   connectInference,
   onChatDone,
@@ -176,6 +178,14 @@ export default function Chat() {
           placeholder="Message…"
           rows={2}
           className="flex-1 text-[13px] px-3 py-2 rounded bg-[var(--background-modifier-form-field)] outline-none resize-none border border-[var(--background-modifier-border)] focus:border-[var(--interactive-accent)] min-w-0 text-[var(--text-normal)] placeholder:text-[var(--text-faint)]"
+        />
+        <ConversationToggle disabled={false} />
+        <VoiceInput
+          disabled={busy}
+          onTranscript={(text) => {
+            if (!text) return;
+            setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
+          }}
         />
         <button
           onClick={send}
