@@ -11,6 +11,8 @@ pub mod embedder;
 pub mod llm;
 pub mod search;
 pub mod settings;
+pub mod stt;
+pub mod voice;
 
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +25,9 @@ pub struct AppState {
     /// thread can share the same instance instead of opening its own
     /// (which would mean two copies of the embedder model in memory).
     pub search: Arc<Mutex<Option<search::VaultSearch>>>,
+    pub whisper: Arc<stt::WhisperHandle>,
+    pub mic: Arc<stt::MicHandle>,
+    pub voice: Arc<voice::VoiceHandle>,
 }
 
 impl AppState {
@@ -34,6 +39,9 @@ impl AppState {
             settings: Mutex::new(settings),
             vault_path: Mutex::new(vault_path),
             search: Arc::new(Mutex::new(None)),
+            whisper: Arc::new(stt::WhisperHandle::default()),
+            mic: Arc::new(stt::MicHandle::default()),
+            voice: Arc::new(voice::VoiceHandle::default()),
         }
     }
 }
@@ -62,6 +70,14 @@ pub fn run() {
             commands::connect_inference,
             commands::send_chat_message,
             commands::stop_chat,
+            commands::transcribe_audio,
+            commands::start_recording,
+            commands::stop_recording_and_transcribe,
+            commands::voice_start,
+            commands::voice_stop,
+            commands::voice_interrupt,
+            commands::voice_set_muted,
+            commands::voice_start_wake,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
