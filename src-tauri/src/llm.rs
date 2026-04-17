@@ -421,16 +421,29 @@ fn format_prompt(
     let mut chat_msgs: Vec<llama_cpp_2::model::LlamaChatMessage> = Vec::new();
 
     for msg in messages {
+        // Tool results: Gemma chat templates vary in how they handle role="tool".
+        // Rewrite tool responses as user-role messages with explicit marker so
+        // the model ALWAYS sees the data regardless of template handling.
+        if msg.role.is_tool() {
+            let body = format!(
+                "TOOL_RESPONSE from tool call id={}:\n---\n{}\n---\nUse ONLY this data to answer. Do not invent file names, URLs, or facts not in the TOOL_RESPONSE above.",
+                msg.tool_call_id.as_deref().unwrap_or(""),
+                msg.content
+            );
+            match llama_cpp_2::model::LlamaChatMessage::new("user".to_string(), body) {
+                Ok(m) => chat_msgs.push(m),
+                Err(e) => return Err(format!("Bad tool message: {e}")),
+            }
+            continue;
+        }
+
         let role = match msg.role {
             ChatRole::System => "system",
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
-            ChatRole::Tool => "tool",
+            ChatRole::Tool => "tool", // unreachable per above
         };
-        // For tool results, prepend the tool_call_id for context.
-        let content = if msg.role.is_tool() && msg.tool_call_id.is_some() {
-            format!("[tool_call_id: {}]\n{}", msg.tool_call_id.as_deref().unwrap_or(""), msg.content)
-        } else if !msg.tool_calls.is_empty() {
+        let content = if !msg.tool_calls.is_empty() {
             // Assistant message with tool calls: append tool call JSON.
             let tc_json = serde_json::to_string(&msg.tool_calls).unwrap_or_default();
             if msg.content.is_empty() {
@@ -459,6 +472,12 @@ fn format_prompt(
         ) {
             Ok(result) => {
                 eprintln!("[forge-llm] Using native tool template");
+                eprintln!("[forge-llm] === RENDERED PROMPT (last 2000 chars) ===\n{}\n=== END PROMPT ===",
+                    if result.prompt.len() > 2000 {
+                        &result.prompt[result.prompt.len()-2000..]
+                    } else {
+                        &result.prompt
+                    });
                 return Ok(result.prompt);
             }
             Err(e) => {
@@ -570,6 +589,41 @@ impl ChatRole {
 //   - ```json\n{"name": "...", "arguments": {...}}\n```
 
 fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
+    // Pattern 0: Raw Gemma tool call without tags: "call:tool_name{...}"
+    // We need a complete call (balanced braces).
+    // Normalize Gemma's special quote token rendering first.
+    let normalized = text.replace("<|\"|>", "\"").replace("<|'|>", "'");
+    if let Some(call_start) = normalized.find("call:") {
+        let after = &normalized[call_start + "call:".len()..];
+        if let Some(brace_start) = after.find('{') {
+            // Find balanced closing brace.
+            let bytes = after.as_bytes();
+            let mut depth = 0i32;
+            let mut end: Option<usize> = None;
+            for (i, &b) in bytes.iter().enumerate().skip(brace_start) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(end_pos) = end {
+                let candidate = &after[..=end_pos];
+                eprintln!("[forge-llm] raw call: tool_call content: {:?}", candidate);
+                if let Some(tc) = parse_gemma_tool_call(candidate) {
+                    eprintln!("[forge-llm] parse_gemma_tool_call (raw) result: {:?}", (&tc.name, &tc.arguments));
+                    return Some(tc);
+                }
+            }
+        }
+    }
+
     // Find tool call opening tag: <tool_call>, <|tool_call>, or <|tool_call|>
     let tc_start = text.find("<|tool_call>").map(|p| (p, "<|tool_call>".len()))
         .or_else(|| text.find("<tool_call>").map(|p| (p, "<tool_call>".len())));
@@ -1151,7 +1205,18 @@ fn parse_tool_json(json_str: &str) -> Option<ToolCall> {
 }
 
 fn might_be_tool_call_start(text: &str) -> bool {
-    let tail = if text.len() > 40 { &text[text.len() - 40..] } else { text };
+    let tail = if text.len() > 80 { &text[text.len() - 80..] } else { text };
+    // Raw Gemma tool-call patterns (no wrapper tags):
+    //   call:tool_name{...}
+    //   tool\ntool_name\ndone
+    // These need to be held back so the raw syntax doesn't leak to UI.
+    if tail.contains("call:") || tail.ends_with("cal") || tail.ends_with("call") {
+        return true;
+    }
+    // "tool\n<name>\ndone" marker sequence from Gemma tool template.
+    if tail.contains("\ntool\n") || tail.ends_with("\ntool") || tail.ends_with("tool\n") {
+        return true;
+    }
     tail.contains("<tool")
         || tail.contains("<func")
         || tail.contains("<|python")
@@ -1163,7 +1228,7 @@ fn might_be_tool_call_start(text: &str) -> bool {
 
 fn extract_pre_tool_text(text: &str) -> String {
     // Return text before any tool call marker.
-    for marker in ["<|tool_call>", "<tool_call>", "<functioncall>", "<|python_tag|>"] {
+    for marker in ["<|tool_call>", "<tool_call>", "<functioncall>", "<|python_tag|>", "call:"] {
         if let Some(pos) = text.find(marker) {
             return text[..pos].to_string();
         }
@@ -1179,10 +1244,54 @@ fn strip_tool_markers(text: &str) -> String {
         "<|tool_call|>", "<tool_call|>", "<|tool_call>", "<tool_call>",
         "</tool_call>", "<functioncall>", "</functioncall>",
         "<|python_tag|>", "<|channel>", "<channel|>", "<|channel|>", "</channel>",
+        // Gemma special quote tokens rendered as literal text.
+        "<|\"|>", "<|'|>",
     ];
     let mut out = text.to_string();
     for marker in markers {
         out = out.replace(marker, "");
+    }
+    // Also strip Gemma's raw "call:...{...}" and "tool\nname\ndone" patterns
+    // in case they leak through (should be caught by parser but be defensive).
+    // Remove any "call:toolname{...balanced...}" sequence.
+    while let Some(start) = out.find("call:") {
+        let after = &out[start..];
+        if let Some(brace_start) = after.find('{') {
+            let mut depth = 0i32;
+            let mut end_idx: Option<usize> = None;
+            for (i, &b) in after.as_bytes().iter().enumerate().skip(brace_start) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(e) = end_idx {
+                let absolute_end = start + e + 1;
+                out.replace_range(start..absolute_end, "");
+                continue;
+            }
+        }
+        break;
+    }
+    // Strip "tool\n<word>\ndone" sequences.
+    let re_patterns = ["\ntool\n", "tool\n"];
+    for _ in 0..3 {
+        for p in &re_patterns {
+            if let Some(start) = out.find(p) {
+                let after = &out[start + p.len()..];
+                if let Some(done_rel) = after.find("done") {
+                    let end = start + p.len() + done_rel + "done".len();
+                    out.replace_range(start..end, "");
+                }
+            }
+        }
     }
     out
 }
