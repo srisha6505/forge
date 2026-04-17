@@ -35,6 +35,8 @@ export interface Settings {
   ai_provider: string;
   api_key: string | null;
   api_model: string;
+  whisper_model_path: string | null;
+  whisper_language: string;
 }
 
 export interface ChatTurn {
@@ -132,3 +134,35 @@ export const searchVault = (query: string, limit?: number) =>
   invoke<SearchHit[]>("search_vault", { query, limit: limit ?? null });
 export const reindexVault = () => invoke<SearchStatus>("reindex_vault");
 export const searchStatus = () => invoke<SearchStatus>("search_status");
+
+// ── Speech-to-text ──────────────────────────────────────────────────────
+
+export const transcribeAudio = (wavBytes: Uint8Array) =>
+  invoke<string>("transcribe_audio", { wavBytes: Array.from(wavBytes) });
+export const startRecording = () => invoke<void>("start_recording");
+export const stopRecordingAndTranscribe = () =>
+  invoke<string>("stop_recording_and_transcribe");
+
+// ── Voice conversation mode ─────────────────────────────────────────────
+
+export const voiceStart = () => invoke<void>("voice_start");
+export const voiceStartWake = () => invoke<void>("voice_start_wake");
+export const voiceStop = () => invoke<void>("voice_stop");
+export const voiceInterrupt = () => invoke<void>("voice_interrupt");
+export const voiceSetMuted = (muted: boolean) =>
+  invoke<void>("voice_set_muted", { muted });
+
+export const onVoiceState = (handler: (state: string) => void): Promise<UnlistenFn> =>
+  listen<string>("voice://state", (e) => handler(e.payload));
+export const onVoiceTranscript = (handler: (text: string) => void): Promise<UnlistenFn> =>
+  listen<string>("voice://transcript", (e) => handler(e.payload));
+export const onVoiceAssistantText = (handler: (text: string) => void): Promise<UnlistenFn> =>
+  listen<string>("voice://assistant-text", (e) => handler(e.payload));
+export const onVoiceTtsChunk = (handler: (b64: string) => void): Promise<UnlistenFn> =>
+  listen<string>("voice://tts-chunk", (e) => handler(e.payload));
+export const onVoiceError = (handler: (msg: string) => void): Promise<UnlistenFn> =>
+  listen<string>("voice://error", (e) => handler(e.payload));
+export const onVoiceStopped = (handler: () => void): Promise<UnlistenFn> =>
+  listen<void>("voice://stopped", () => handler());
+export const onVoiceBargeIn = (handler: () => void): Promise<UnlistenFn> =>
+  listen<void>("voice://barge-in", () => handler());
