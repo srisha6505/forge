@@ -59,8 +59,26 @@ impl VaultSearch {
         };
         let hnsw = usearch::new_index(&opts)?;
 
-        if index_path.exists() && fs::metadata(index_path).map(|m| m.len() > 0).unwrap_or(false) {
-            hnsw.load(index_path.to_str().ok_or("invalid index path")?)?;
+        if index_path.exists() && fs::metadata(index_path).map(|m| m.len() > 100).unwrap_or(false) {
+            // usearch may panic on malformed index files. Isolate the load
+            // so a bad file just means we rebuild rather than crash.
+            let load_path = index_path.to_path_buf();
+            let hnsw_clone = &hnsw;
+            let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hnsw_clone.load(load_path.to_str().ok_or_else(|| "invalid path".to_string())?)
+                    .map_err(|e| e.to_string())
+            }));
+            match load_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("[forge] hnsw load failed: {e}. Starting fresh.");
+                    let _ = fs::remove_file(index_path);
+                }
+                Err(_) => {
+                    eprintln!("[forge] hnsw load panicked. Starting fresh.");
+                    let _ = fs::remove_file(index_path);
+                }
+            }
         }
 
         // Try to load the local embedding model. If it fails (e.g. first run,
@@ -160,11 +178,22 @@ impl VaultSearch {
             )?;
 
             if self.vectors_enabled {
-                if let Some(vector) = self.embedder.as_ref().and_then(|e| e.embed(&chunk_text).ok()) {
-                    if self.hnsw.capacity() < self.hnsw.size() + 1 {
-                        self.hnsw.reserve(self.hnsw.capacity().max(64) * 2)?;
+                // Isolate embedder + hnsw ops: one bad chunk must not kill
+                // the whole indexing run.
+                let chunk_text_copy = chunk_text.clone();
+                let embedder = self.embedder.as_ref();
+                let hnsw = &self.hnsw;
+                let id_local = id;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let vector = embedder?.embed(&chunk_text_copy).ok()?;
+                    if hnsw.capacity() < hnsw.size() + 1 {
+                        let _ = hnsw.reserve(hnsw.capacity().max(64) * 2);
                     }
-                    self.hnsw.add(id, &vector)?;
+                    let _ = hnsw.add(id_local, &vector);
+                    Some(())
+                }));
+                if result.is_err() {
+                    eprintln!("[forge] embed/add panicked on chunk {id_local}, skipping");
                 }
             }
         }
@@ -306,6 +335,23 @@ impl VaultSearch {
         };
 
         let vec_k = k * 2;
+        if self.hnsw.size() == 0 {
+            let mut scored: Vec<(u64, f32)> = bm25_map
+                .iter()
+                .map(|(&id, (score, _))| (id, *score))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+            return Ok(scored
+                .into_iter()
+                .filter_map(|(id, score)| {
+                    bm25_map.get(&id).map(|(_, chunk)| SearchResult {
+                        chunk: chunk.clone(),
+                        score,
+                    })
+                })
+                .collect());
+        }
         let matches = self.hnsw.search(&query_vector, vec_k)?;
 
         let mut vector_map: HashMap<u64, f32> = HashMap::new();
@@ -378,6 +424,11 @@ impl VaultSearch {
     }
 
     pub fn save_index(&self, path: &Path) -> Result<()> {
+        // usearch save on empty index can produce a malformed file that
+        // crashes on next load. Only save if we have at least one vector.
+        if self.hnsw.size() == 0 {
+            return Ok(());
+        }
         self.hnsw.save(path.to_str().ok_or("invalid index path")?)?;
         Ok(())
     }
