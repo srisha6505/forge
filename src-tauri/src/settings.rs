@@ -54,7 +54,25 @@ pub struct Settings {
     /// Anthropic model name.
     #[serde(default = "default_api_model")]
     pub api_model: String,
+    /// Path to a whisper.cpp GGML model for speech-to-text.
+    #[serde(default)]
+    pub whisper_model_path: Option<PathBuf>,
+    /// Whisper language hint. "auto" for autodetect.
+    #[serde(default = "default_whisper_language")]
+    pub whisper_language: String,
+    #[serde(default)]
+    pub piper_bin_path: Option<PathBuf>,
+    #[serde(default)]
+    pub piper_voice_path: Option<PathBuf>,
+    /// Optional wake phrase. When set, conversation sessions can require
+    /// this word before processing a prompt.
+    #[serde(default = "default_wake_word")]
+    pub wake_word: String,
 }
+
+pub fn default_wake_word() -> String { "Riva".into() }
+
+pub fn default_whisper_language() -> String { "auto".into() }
 
 pub fn default_body_font() -> String { "DejaVu Sans".to_string() }
 pub fn default_interface_font() -> String { "DejaVu Sans".to_string() }
@@ -88,6 +106,11 @@ impl Default for Settings {
             ai_provider: default_provider(),
             api_key: None,
             api_model: default_api_model(),
+            whisper_model_path: None,
+            whisper_language: default_whisper_language(),
+            piper_bin_path: None,
+            piper_voice_path: None,
+            wake_word: default_wake_word(),
         }
     }
 }
