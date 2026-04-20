@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Copilot OAuth Test</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <section id="auth">
+    <h1>GitHub Copilot Test</h1>
+    <button id="login-btn">Sign in with GitHub</button>
+    <div id="code-panel" hidden>
+      <p>Open this URL in your browser:</p>
+      <div class="url-row">
+        <a id="verify-url" target="_blank" rel="noopener"></a>
+        <button type="button" id="copy-url-btn" class="small">Copy URL</button>
+        <button type="button" id="open-url-btn" class="small">Open</button>
+      </div>
+      <p>Enter this code:</p>
+      <div class="code-row">
+        <div id="user-code"></div>
+        <button type="button" id="copy-code-btn" class="small">Copy code</button>
+      </div>
+      <p id="poll-status" class="status">Waiting for authorization...</p>
+    </div>
+  </section>
+
+  <section id="chat" hidden>
+    <header>
+      <h1>Copilot Chat</h1>
+      <div>
+        <select id="model"><option value="">Loading models…</option></select>
+        <button id="logout-btn">Sign out</button>
+      </div>
+    </header>
+    <div id="messages"></div>
+    <form id="send-form">
+      <input id="msg-input" placeholder="Ask Copilot..." autocomplete="off" required>
+      <button type="submit">Send</button>
+    </form>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
