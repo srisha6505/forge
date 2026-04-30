@@ -10,6 +10,10 @@ pub mod binaries;
 pub mod chat;
 pub mod commands;
 pub mod copilot;
+// Vault semantic search subsystem — see Cargo.toml comment. Disabled
+// on Windows until usearch 2.x ships a fix for the MAP_FAILED MSVC
+// build break.
+#[cfg(not(target_os = "windows"))]
 pub mod embedder;
 pub mod gemini;
 pub mod latex;
@@ -18,6 +22,7 @@ pub mod llm;
 pub mod models;
 pub mod openai;
 pub mod openai_compat;
+#[cfg(not(target_os = "windows"))]
 pub mod search;
 pub mod settings;
 pub mod skills;
@@ -35,6 +40,7 @@ pub struct AppState {
     /// Lazy-initialised vault search index. Wrapped in Arc so the agent
     /// thread can share the same instance instead of opening its own
     /// (which would mean two copies of the embedder model in memory).
+    #[cfg(not(target_os = "windows"))]
     pub search: Arc<Mutex<Option<search::VaultSearch>>>,
     pub whisper: Arc<stt::WhisperHandle>,
     pub mic: Arc<stt::MicHandle>,
@@ -53,6 +59,7 @@ impl AppState {
             inference: Mutex::new(None),
             settings: Mutex::new(settings),
             vault_path: Mutex::new(vault_path),
+            #[cfg(not(target_os = "windows"))]
             search: Arc::new(Mutex::new(None)),
             whisper: Arc::new(stt::WhisperHandle::default()),
             mic: Arc::new(stt::MicHandle::default()),
@@ -98,8 +105,11 @@ pub fn run() {
             commands::write_file,
             commands::rename_file,
             commands::delete_file,
+            #[cfg(not(target_os = "windows"))]
             commands::search_vault,
+            #[cfg(not(target_os = "windows"))]
             commands::reindex_vault,
+            #[cfg(not(target_os = "windows"))]
             commands::search_status,
             commands::connect_inference,
             commands::send_chat_message,

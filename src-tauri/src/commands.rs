@@ -322,6 +322,7 @@ fn search_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
 /// because the embedder / hf-hub stack has been observed to panic on
 /// network or ONNX runtime errors; we'd rather surface a string error
 /// to the UI than crash the whole Tauri app.
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 pub fn reindex_vault(state: State<'_, AppState>) -> Result<SearchStatus, String> {
     let vault = state
@@ -372,6 +373,7 @@ pub fn reindex_vault(state: State<'_, AppState>) -> Result<SearchStatus, String>
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 pub fn search_status(state: State<'_, AppState>) -> Result<SearchStatus, String> {
     let guard = state.search.lock().unwrap();
@@ -389,6 +391,7 @@ pub fn search_status(state: State<'_, AppState>) -> Result<SearchStatus, String>
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 pub fn search_vault(
     state: State<'_, AppState>,
@@ -664,8 +667,11 @@ pub fn send_chat_message(
         .join("forge.db");
 
     // Paths for the shared vault search index used by the agent's
-    // `search_vault` tool. Same files the search panel uses.
+    // `search_vault` tool. Same files the search panel uses. The whole
+    // vault-search subsystem is excluded on Windows (see Cargo.toml).
+    #[cfg(not(target_os = "windows"))]
     let (_cfg, search_db_path, search_index_path) = search_paths()?;
+    #[cfg(not(target_os = "windows"))]
     let search_arc = std::sync::Arc::clone(&state.search);
 
     // Convert frontend history to LLM ChatMessages. The first turn must be
@@ -720,8 +726,11 @@ pub fn send_chat_message(
             let ctx = crate::agent::ToolContext {
                 vault_path: vault,
                 db_path,
+                #[cfg(not(target_os = "windows"))]
                 search: search_arc,
+                #[cfg(not(target_os = "windows"))]
                 search_db_path,
+                #[cfg(not(target_os = "windows"))]
                 search_index_path,
                 user_filename_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 last_write_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -895,7 +904,9 @@ fn voice_start_impl(state: State<'_, AppState>, window: Window, use_wake: bool) 
         .ok_or_else(|| "connect_inference first".to_string())?;
     let vault = state.vault_path.lock().unwrap().clone()
         .ok_or_else(|| "no vault open".to_string())?;
+    #[cfg(not(target_os = "windows"))]
     let search_arc = std::sync::Arc::clone(&state.search);
+    #[cfg(not(target_os = "windows"))]
     let (_cfg, search_db_path, search_index_path) = search_paths()?;
     let db_path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
         .join("forge").join("forge.db");
@@ -958,8 +969,11 @@ fn voice_start_impl(state: State<'_, AppState>, window: Window, use_wake: bool) 
         let ctx = crate::agent::ToolContext {
             vault_path: vault.clone(),
             db_path: db_path.clone(),
+            #[cfg(not(target_os = "windows"))]
             search: std::sync::Arc::clone(&search_arc),
+            #[cfg(not(target_os = "windows"))]
             search_db_path: search_db_path.clone(),
+            #[cfg(not(target_os = "windows"))]
             search_index_path: search_index_path.clone(),
             user_filename_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_write_path: std::sync::Arc::new(std::sync::Mutex::new(None)),

@@ -71,12 +71,16 @@ pub struct ToolContext {
     pub db_path: PathBuf,
     /// Shared vault search index. Same instance the search panel uses,
     /// so the agent benefits from already-built indexes and the embedder
-    /// model that's already loaded in memory.
+    /// model that's already loaded in memory. Compiled out on Windows
+    /// alongside the rest of the search subsystem (see Cargo.toml).
+    #[cfg(not(target_os = "windows"))]
     pub search: std::sync::Arc<std::sync::Mutex<Option<crate::search::VaultSearch>>>,
     /// Path to the on-disk usearch vector index (used to lazy-init the
     /// shared `search` field if it hasn't been opened yet).
+    #[cfg(not(target_os = "windows"))]
     pub search_index_path: PathBuf,
     /// Path to the on-disk SQLite chunks DB (paired with `search_index_path`).
+    #[cfg(not(target_os = "windows"))]
     pub search_db_path: PathBuf,
     /// Filename hint extracted from the most recent user message (e.g.
     /// "grav.md" when the user said "make grav.md"). Used by write_file
@@ -167,28 +171,11 @@ fn validate_vault_path(vault_root: &Path, rel_path: &str, must_exist: bool) -> R
 // ── Tool schemas (OpenAI function-calling format) ──
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
-    serde_json::json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "search_vault",
-                "description": "Search the user's note vault using keyword and semantic search. Returns matching chunks with file paths, headings, and content snippets.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default 5)"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
+    let mut tools = serde_json::json!([
+        // search_vault is appended below on non-Windows targets only.
+        // Windows builds skip the entire vault-search subsystem (see
+        // Cargo.toml comment), so the tool is hidden from the model
+        // rather than registered as a no-op.
         {
             "type": "function",
             "function": {
@@ -372,7 +359,26 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     ])
     .as_array()
     .cloned()
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    #[cfg(not(target_os = "windows"))]
+    tools.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "search_vault",
+            "description": "Search the user's note vault using keyword and semantic search. Returns matching chunks with file paths, headings, and content snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query" },
+                    "limit": { "type": "integer", "description": "Maximum number of results (default 5)" }
+                },
+                "required": ["query"]
+            }
+        }
+    }));
+
+    tools
 }
 
 // ── Tool execution ──
@@ -393,6 +399,7 @@ pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> ToolResult {
     }
     let tool_call = &sanitized;
     match tool_call.name.as_str() {
+        #[cfg(not(target_os = "windows"))]
         "search_vault" => exec_search_vault(tool_call, ctx),
         "read_file" => exec_read_file(tool_call, ctx),
         "list_files" => exec_list_files(tool_call, ctx),
@@ -410,6 +417,7 @@ pub fn execute_tool(tool_call: &ToolCall, ctx: &ToolContext) -> ToolResult {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn exec_search_vault(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
     let query = tc.arguments.get("query")
         .and_then(|v| v.as_str())
