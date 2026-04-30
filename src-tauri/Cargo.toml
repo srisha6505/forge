@@ -30,7 +30,7 @@ serde_json = "1"
 # Backend deps preserved from the GPUI version
 dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
-usearch = { version = "2", default-features = false, features = ["fp16lib"] }
+usearch = { version = "2", default-features = false }
 ureq = { version = "2", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
 candle-core = "0.8"

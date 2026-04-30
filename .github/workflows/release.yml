@@ -31,9 +31,13 @@ jobs:
           - os: macos-latest
             label: macos-aarch64
             tauri-args: '--bundles dmg,app --target aarch64-apple-darwin'
-          - os: macos-13
-            label: macos-x86_64
-            tauri-args: '--bundles dmg,app --target x86_64-apple-darwin'
+          # Intel Mac (macos-13) runner pool is currently starved on
+          # GitHub Actions free/standard tier, jobs sit pending for
+          # hours. Apple Silicon dmg covers most users (every Mac since
+          # 2020). Re-enable when needed for explicit Intel coverage.
+          # - os: macos-13
+          #   label: macos-x86_64
+          #   tauri-args: '--bundles dmg,app --target x86_64-apple-darwin'
 
     runs-on: ${{ matrix.os }}
     name: build (${{ matrix.label }})
@@ -53,7 +57,8 @@ jobs:
             librsvg2-bin \
             patchelf \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            libasound2-dev
 
       # ── Toolchains ───────────────────────────────────────────────────
       - name: Install Rust
