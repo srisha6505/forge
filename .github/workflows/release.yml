@@ -16,6 +16,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# tauri-action calls the Releases API on tag push to create the
+# release page and upload bundles as assets. The default GITHUB_TOKEN
+# only has `contents: read`; without this block the API call returns
+# "Resource not accessible by integration" and the job fails AFTER
+# building the binaries successfully.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
