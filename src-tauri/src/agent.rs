@@ -769,6 +769,8 @@ fn exec_write_file(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
         Ok(()) => {
             // Best-effort incremental search index update so the file is
             // findable immediately. Failure here doesn't fail the tool.
+            // Skipped on Windows where the search subsystem is compiled out.
+            #[cfg(not(target_os = "windows"))]
             if let Ok(mut guard) = ctx.search.lock() {
                 if let Some(vs) = guard.as_mut() {
                     let _ = vs.index_file(&full_path);

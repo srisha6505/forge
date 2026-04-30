@@ -49,7 +49,9 @@ portable-pty = "0.8"
 # get full vault search; Windows builds skip the entire subsystem
 # (search.rs / embedder.rs / search commands all cfg-gated to match).
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-usearch = { version = "2", default-features = false }
+# fp16lib provides a portable FP16 fallback. Without it the bundled
+# C++ uses GCC-specific `_Float16` which Ubuntu's gcc 11 rejects.
+usearch = { version = "2", default-features = false, features = ["fp16lib"] }
 candle-core = "0.8"
 candle-nn = "0.8"
 candle-transformers = "0.8"
