@@ -37,6 +37,17 @@ export interface Settings {
   api_model: string;
   whisper_model_path: string | null;
   whisper_language: string;
+  piper_bin_path: string | null;
+  piper_voice_path: string | null;
+  wake_word: string;
+  copilot_model: string;
+  stt_provider: string;
+  tts_provider: string;
+  deepgram_api_key: string | null;
+  deepgram_stt_model: string;
+  deepgram_tts_voice: string;
+  edge_tts_voice: string;
+  gtts_lang: string;
 }
 
 export interface ChatTurn {
@@ -50,7 +61,135 @@ export interface ConnectResult {
 
 // ── Settings ────────────────────────────────────────────────────────────
 
+// New two-scope settings (Phase 1). Legacy `getSettings`/`setSettings` are
+// kept below as adapters so existing call sites keep working while screens
+// migrate.
+
+export interface AppSettings {
+  last_opened_vault: string | null;
+}
+
+export interface ProviderConfig {
+  api_key: string | null;
+  base_url: string | null;
+  default_model: string | null;
+}
+
+export interface RoutedModel {
+  provider: string;
+  model: string;
+}
+
+export interface RoutingConfig {
+  chat: RoutedModel | null;
+  fast: RoutedModel | null;
+  summarise: RoutedModel | null;
+  embed: RoutedModel | null;
+}
+
+export interface AiSettings {
+  default_provider: string;
+  providers: Record<string, ProviderConfig>;
+  routing: RoutingConfig;
+}
+
+export interface VoiceSettings {
+  stt_provider: "whisper" | "none" | string;
+  whisper_model: string;
+  tts_voice: string;
+}
+
+export interface VaultSettings {
+  theme: "light" | "dark" | string;
+  sidebar_width: number;
+  chat_panel_width: number;
+  recent_files: string[];
+  ai: AiSettings;
+  voice: VoiceSettings;
+  system_prompt: string;
+  tools_allowed: string[];
+}
+
+export const getAppSettings = () =>
+  invoke<AppSettings>("get_app_settings");
+export const setAppSettings = (settings: AppSettings) =>
+  invoke<void>("set_app_settings", { settings });
+
+export const getVaultSettings = (vaultPath: string) =>
+  invoke<VaultSettings>("get_vault_settings", { vaultPath });
+export const setVaultSettings = (
+  vaultPath: string,
+  settings: VaultSettings,
+) => invoke<void>("set_vault_settings", { vaultPath, settings });
+export const migrateVaultSettings = (vaultPath: string) =>
+  invoke<boolean>("migrate_vault_settings", { vaultPath });
+
+// ── Chats (markdown-on-disk) ────────────────────────────────────────────
+
+export type ChatRole = "user" | "assistant" | "tool";
+
+export interface ChatMarkdownTurn {
+  role: ChatRole;
+  timestamp: string;
+  body: string;
+}
+
+export interface ChatHeader {
+  forge_chat: number;
+  created: string;
+  updated: string;
+  model: string | null;
+  provider: string | null;
+  system_prompt: string | null;
+  tools_allowed: string[];
+}
+
+export interface ChatFile {
+  id: string;
+  path: string;
+  header: ChatHeader;
+  turns: ChatMarkdownTurn[];
+}
+
+export interface ChatSummary {
+  id: string;
+  path: string;
+  title: string;
+  created: string;
+  updated: string;
+  model: string | null;
+  turn_count: number;
+}
+
+export interface SaveChatPayload {
+  vault_path: string;
+  chat_id: string | null;
+  header: ChatHeader;
+  turns: ChatMarkdownTurn[];
+}
+
+export const saveChat = (payload: SaveChatPayload) =>
+  invoke<ChatSummary>("save_chat", { payload });
+export const loadChat = (vaultPath: string, chatId: string) =>
+  invoke<ChatFile>("load_chat", { vaultPath, chatId });
+export const listChats = (vaultPath: string) =>
+  invoke<ChatSummary[]>("list_chats", { vaultPath });
+export const deleteChat = (vaultPath: string, chatId: string) =>
+  invoke<void>("delete_chat", { vaultPath, chatId });
+export const exportChatAsNote = (
+  vaultPath: string,
+  chatId: string,
+  destRelpath: string,
+) =>
+  invoke<string>("export_chat_as_note", {
+    vaultPath,
+    chatId,
+    destRelpath,
+  });
+
+/** @deprecated Use getVaultSettings / getAppSettings instead. */
 export const getSettings = () => invoke<Settings>("get_settings");
+/** @deprecated Use setVaultSettings / setAppSettings instead. */
 export const setSettings = (settings: Settings) =>
   invoke<void>("set_settings", { new: settings });
 
@@ -166,3 +305,260 @@ export const onVoiceStopped = (handler: () => void): Promise<UnlistenFn> =>
   listen<void>("voice://stopped", () => handler());
 export const onVoiceBargeIn = (handler: () => void): Promise<UnlistenFn> =>
   listen<void>("voice://barge-in", () => handler());
+
+// ── LaTeX ───────────────────────────────────────────────────────────────
+
+export interface LatexCompileResult {
+  pdf_path: string;
+  log: string;
+  engine: string;
+}
+
+export interface LatexStatus {
+  tectonic: boolean;
+  xelatex: boolean;
+  pdflatex: boolean;
+}
+
+export const compileLatex = (path: string) =>
+  invoke<LatexCompileResult>("compile_latex", { path });
+export const latexStatus = () => invoke<LatexStatus>("latex_status");
+export const openInTextEditor = (path: string) =>
+  invoke<void>("open_in_text_editor", { path });
+
+// ── Copilot auth ────────────────────────────────────────────────────────
+
+export interface CopilotStatus {
+  signed_in: boolean;
+  login: string | null;
+}
+
+export interface DeviceCode {
+  user_code: string;
+  verification_uri: string;
+  device_code: string;
+  interval: number;
+  expires_in: number;
+}
+
+export type CopilotPollResult =
+  | { status: "pending" }
+  | { status: "slow_down" }
+  | { status: "ok"; login: string | null }
+  | { status: "denied" }
+  | { status: "expired" }
+  | { status: "other"; message: string }
+  | { status: "no_code" };
+
+export interface CopilotModel {
+  id: string;
+  name: string;
+  vendor: string;
+}
+
+export const copilotStatus = () => invoke<CopilotStatus>("copilot_status");
+export const copilotLoginStart = () =>
+  invoke<DeviceCode>("copilot_login_start");
+export const copilotLoginPoll = () =>
+  invoke<CopilotPollResult>("copilot_login_poll");
+export const copilotLogout = () => invoke<void>("copilot_logout");
+export const copilotModels = () => invoke<CopilotModel[]>("copilot_models");
+
+// ── Models catalog + downloads ──────────────────────────────────────────
+
+export type ModelKind = "llm" | "stt" | "tts";
+
+export interface ModelInfo {
+  id: string;
+  kind: ModelKind;
+  name: string;
+  description: string;
+  size_bytes: number;
+  url: string;
+  filename: string;
+  local_path: string | null;
+  downloaded: boolean;
+  on_disk_bytes: number | null;
+}
+
+export interface DownloadProgress {
+  id: string;
+  downloaded: number;
+  total: number;
+  phase: string; // "primary" | "config" | "done" | "cancelled" | "error"
+  error: string | null;
+}
+
+export interface GpuStatus {
+  cuda_available: boolean;
+  details: string;
+}
+
+// ── Build capabilities ────────────────────────────────────────────────
+
+export interface RuntimeCapabilities {
+  /** True if the bundled llama.cpp + CUDA runtime is in this build.
+   *  Lite builds set this to false; the local GGUF tab and model-download
+   *  manager hide themselves and `connect_inference` errors out if the
+   *  user picks the local provider. Local LLMs in lite builds run via
+   *  Ollama through the openai_compat provider. */
+  local_llm: boolean;
+}
+
+let _capsPromise: Promise<RuntimeCapabilities> | null = null;
+/** Cached lazy fetch of build features. Call freely; runs the IPC at most
+ *  once per page load. */
+export const runtimeCapabilities = (): Promise<RuntimeCapabilities> => {
+  if (!_capsPromise) {
+    _capsPromise = invoke<RuntimeCapabilities>("runtime_capabilities").catch(
+      // Older backends without the command: assume full build.
+      () => ({ local_llm: true }),
+    );
+  }
+  return _capsPromise;
+};
+
+export const listModels = () => invoke<ModelInfo[]>("list_models");
+export const startModelDownload = (id: string) =>
+  invoke<void>("start_model_download", { id });
+export const cancelModelDownload = (id: string) =>
+  invoke<boolean>("cancel_model_download", { id });
+export const deleteModel = (id: string) =>
+  invoke<boolean>("delete_model", { id });
+export const detectGpu = () => invoke<GpuStatus>("detect_gpu");
+export const onModelDownloadProgress = (
+  handler: (p: DownloadProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<DownloadProgress>("model://download-progress", (e) =>
+    handler(e.payload),
+  );
+
+// ── External binaries (whisper-cli, piper) ──────────────────────────────
+
+export interface BinaryStatus {
+  whisper_cli: string | null;
+  piper: string | null;
+}
+
+export interface BinaryInstallEvent {
+  id: string; // "whisper-cli" | "piper"
+  phase: string; // cloning | building | downloading | extracting | done | error
+  detail: string;
+  progress: number | null;
+}
+
+export const binaryStatus = () => invoke<BinaryStatus>("binary_status");
+export const installWhisperCpp = () => invoke<void>("install_whisper_cpp");
+export const installPiper = () => invoke<void>("install_piper");
+export const cancelBinaryInstall = (id: string) =>
+  invoke<boolean>("cancel_binary_install", { id });
+export const onBinaryInstall = (
+  handler: (e: BinaryInstallEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<BinaryInstallEvent>("binary://install", (e) => handler(e.payload));
+
+// ── Links / backlinks / graph ───────────────────────────────────────────
+
+export interface LinkHit {
+  path: string;
+  name: string;
+  snippet: string;
+}
+
+export interface GraphNode {
+  id: string;
+  name: string;
+  degree: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+export interface LinkGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export const listBacklinks = (target: string) =>
+  invoke<LinkHit[]>("list_backlinks", { target });
+export const linkGraph = () => invoke<LinkGraph>("link_graph");
+
+// ── AI providers (Phase 3) ─────────────────────────────────────────────
+
+export interface ProviderCapabilities {
+  context_window: number;
+  max_output: number;
+  tokenizer_kind: string;
+  supports_caching: boolean;
+  supports_tools: boolean;
+  supports_vision: boolean;
+}
+
+export interface ProviderModel {
+  id: string;
+  display_name: string;
+  capabilities: ProviderCapabilities;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  error: string | null;
+  models: ProviderModel[];
+}
+
+export const testAnthropic = (
+  apiKey: string,
+  baseUrl?: string,
+): Promise<ProviderTestResult> =>
+  invoke<ProviderTestResult>("test_anthropic", {
+    apiKey,
+    baseUrl: baseUrl ?? null,
+  });
+export const testOpenai = (
+  apiKey: string,
+  baseUrl?: string,
+): Promise<ProviderTestResult> =>
+  invoke<ProviderTestResult>("test_openai", {
+    apiKey,
+    baseUrl: baseUrl ?? null,
+  });
+export const testGemini = (apiKey: string): Promise<ProviderTestResult> =>
+  invoke<ProviderTestResult>("test_gemini", { apiKey });
+export const testCopilot = (): Promise<ProviderTestResult> =>
+  invoke<ProviderTestResult>("test_copilot");
+export const testOpenaiCompat = (
+  apiKey: string,
+  baseUrl: string,
+): Promise<ProviderTestResult> =>
+  invoke<ProviderTestResult>("test_openai_compat", { apiKey, baseUrl });
+export const listProviderModels = (
+  provider: string,
+  apiKey?: string,
+  baseUrl?: string,
+): Promise<ProviderModel[]> =>
+  invoke<ProviderModel[]>("list_provider_models", {
+    provider,
+    apiKey: apiKey ?? null,
+    baseUrl: baseUrl ?? null,
+  });
+
+// ── Terminal ────────────────────────────────────────────────────────────
+
+export type TerminalOutputEvent = { id: number; bytes_b64: string };
+
+export const spawnTerminal = (vaultPath: string | null) =>
+  invoke<number>("spawn_terminal", { vaultPath });
+export const writeTerminal = (id: number, data: string) =>
+  invoke<void>("write_terminal", { id, data });
+export const resizeTerminal = (id: number, cols: number, rows: number) =>
+  invoke<void>("resize_terminal", { id, cols, rows });
+export const killTerminal = (id: number) =>
+  invoke<void>("kill_terminal", { id });
+export const listTerminals = () => invoke<number[]>("list_terminals");
+
+export const onTerminalOutput = (
+  handler: (e: TerminalOutputEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<TerminalOutputEvent>("terminal://output", (ev) => handler(ev.payload));

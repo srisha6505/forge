@@ -508,3 +508,51 @@ Edit `:root` CSS variables in `src/index.css`. All components read them via `var
 Currently none exist. The pattern will be:
 - Global: `useEffect` on `window.addEventListener("keydown", ...)` in `App.tsx`
 - Editor-local: CodeMirror `keymap.of([...])` extension in `cm-theme.ts`
+
+---
+
+## Addendum — modules not yet folded into the sections above (2026-04-23)
+
+The above sections are stale relative to the current source tree. New files
+that exist on disk but are not documented above. Each gets a one-line
+summary; full per-section integration pending.
+
+### Frontend components
+- `src/components/BacklinksPanel.tsx` — backlinks for active file via `listBacklinks`. Uses `links.rs` indexer.
+- `src/components/GraphView.tsx` (332 lines) — full vault graph, force-directed via `react-force-graph-2d` + `d3-force`, search, click-to-open.
+- `src/components/MarkdownPreview.tsx` — md preview pane.
+- `src/components/PdfViewer.tsx` (435 lines) — pdfjs-based, worker pinned (see commit `ba971b9`).
+- `src/components/LatexViewer.tsx` (629 lines) — save .tex + recompile + render PDF.
+- `src/components/ImageViewer.tsx` (365 lines) — image viewer.
+- `src/components/DocxViewer.tsx` — DOCX render via mammoth.
+- `src/components/SettingsModal.tsx` (964 lines), `AppearanceModal.tsx` — split settings.
+- `src/components/SearchModal.tsx` (383 lines), `Search.tsx` (233 lines) — search UI.
+- `src/components/VoiceInput.tsx`, `ConversationToggle.tsx` — voice input + conversation mode toggle.
+- `src/components/ErrorBoundary.tsx` — top-level React error boundary.
+- `src/components/chat/` — `ChatComposer.tsx`, `ChatToolbar.tsx`, `RunningIndicator.tsx`, `ToolCallCard.tsx`.
+
+### Frontend lib
+- `src/lib/cm-wikilinks.ts` (214 lines) — `[[target]]` / `[[target|alias]]` widget; cursor-line aware (Obsidian-style live preview).
+- `src/lib/cm-hyperlinks.ts` (81 lines) — markdown hyperlink widgets.
+- `src/lib/cm-math.ts` (256 lines) — inline + display math rendering.
+- `src/lib/cm-markdown-render.ts` (427 lines) — main render layer.
+- `src/lib/file-types.ts` — file type detection / routing.
+
+### Rust modules
+- `src-tauri/src/links.rs` (196 lines) — wikilink scanner + forward/reverse graph. Supports `[[t]]`, `[[t|alias]]`, `[[t#heading]]`.
+- `src-tauri/src/copilot.rs` (234 lines) — GitHub Copilot API client; device-flow OAuth + token exchange to use a Copilot subscription as a chat backend.
+- `src-tauri/src/voice.rs` (774 lines) — conversation orchestrator: continuous mic → VAD → STT → LLM → TTS hands-free loop with UI events.
+- `src-tauri/src/vad.rs` (136 lines) — Silero VAD via ONNX Runtime.
+- `src-tauri/src/stt.rs` (263 lines) — whisper.cpp wrapper, routes through `binaries::resolve_whisper_cli`.
+- `src-tauri/src/deepgram.rs` (349 lines) — Deepgram cloud STT + TTS.
+- `src-tauri/src/edge_tts.rs` (209 lines) — Microsoft Edge TTS (v1 primary TTS).
+- `src-tauri/src/gtts.rs` (133 lines) — Google TTS fallback.
+- `src-tauri/src/latex.rs` (190 lines) — LaTeX compile: tectonic → xelatex → pdflatex fallback. Cache per source under OS temp.
+- `src-tauri/src/models.rs` (454 lines) — managed downloadable model catalog (GGUF, whisper, piper). Discover/download/delete/reference by ID.
+- `src-tauri/src/binaries.rs` (354 lines) — installs whisper-cli (built from source via cmake) and piper into managed dir.
+
+### v1 plan
+- Full per-component build + test catalog at `<repo>/V1_COMPONENTS.md`. Read it before any v1 feature work. Scope decisions (what's bundled, what's downloaded on demand, what's deliberately out) are at the top of that file.
+
+### Conversation persistence
+- `<repo>/CONVCORRECT.md` + `.claude/log-turn.sh` + `.claude/conv-log.md` — Stop hook system that survives compaction. Read `conv-log.md` first on every session.

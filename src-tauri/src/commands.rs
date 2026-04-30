@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State, Window};
 
-use crate::{llm, settings::Settings, AppState};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use crate::{
+    binaries, copilot, latex, links, llm, models, settings::Settings, AppState,
+};
 
 // ── Settings ────────────────────────────────────────────────────────────
 
@@ -78,6 +83,18 @@ pub fn list_vault_tree(state: State<'_, AppState>) -> Result<TreeNode, String> {
     build_tree(&vault).map_err(|e| e.to_string())
 }
 
+fn is_viewable_ext(ext: &str) -> bool {
+    // Keep in sync with src/lib/file-types.ts `fileKind`.
+    matches!(
+        ext,
+        "md" | "markdown" | "mdx"
+        | "pdf" | "tex"
+        | "docx" | "doc" | "odt"
+        | "png" | "jpg" | "jpeg" | "gif" | "webp"
+        | "bmp" | "svg" | "ico" | "avif" | "tif" | "tiff"
+    )
+}
+
 fn build_tree(root: &Path) -> std::io::Result<TreeNode> {
     let name = root
         .file_name()
@@ -106,8 +123,12 @@ fn build_tree(root: &Path) -> std::io::Result<TreeNode> {
                     }
                 }
             } else {
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext == "md" || ext == "markdown" {
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                if is_viewable_ext(&ext) {
                     children.push(TreeNode {
                         name: n,
                         path: p.to_string_lossy().to_string(),
@@ -151,10 +172,13 @@ pub fn list_vault_files(
             continue;
         }
         let is_dir = path.is_dir();
-        // Only surface markdown files + directories to the UI.
         if !is_dir {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "md" && ext != "markdown" {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            if !is_viewable_ext(&ext) {
                 continue;
             }
         }
@@ -473,28 +497,136 @@ pub fn connect_inference(
     state: State<'_, AppState>,
 ) -> Result<ConnectResult, String> {
     let settings = state.settings.lock().unwrap().clone();
+    let vault = state.vault_path.lock().unwrap().clone();
     let provider = settings.ai_provider.as_str();
 
     let handle = if provider == "anthropic" || provider == "claude" {
-        let auth = if let Some(key) = &settings.api_key {
-            llm::AnthropicAuth::ApiKey(key.clone())
-        } else {
-            return Err("No Anthropic credentials configured".into());
-        };
+        // Prefer legacy api_key, then fall back to per-vault provider config.
+        let key = settings
+            .api_key
+            .clone()
+            .or_else(|| provider_key_from_vault(vault.as_deref(), "anthropic"))
+            .ok_or_else(|| "No Anthropic credentials configured".to_string())?;
+        let auth = llm::AnthropicAuth::ApiKey(key);
         llm::spawn_anthropic_thread(auth, &settings.api_model)
             .map_err(|e| e.to_string())?
-    } else {
-        let path = settings
-            .model_path
-            .clone()
-            .ok_or_else(|| "No model_path set in settings".to_string())?;
-        llm::spawn_inference_thread(&path, settings.gpu_layers, settings.ctx_size)
+    } else if provider == "copilot" {
+        if !copilot::is_signed_in() {
+            return Err("Not signed in to GitHub Copilot. Open Settings → LLM → Sign in.".into());
+        }
+        if settings.copilot_model.trim().is_empty() {
+            return Err("No copilot_model set. Pick one in Settings → LLM.".into());
+        }
+        llm::spawn_copilot_thread(&settings.copilot_model)
             .map_err(|e| e.to_string())?
+    } else if provider == "openai" {
+        let key = provider_key_from_vault(vault.as_deref(), "openai")
+            .or_else(|| settings.api_key.clone())
+            .ok_or_else(|| "No OpenAI API key configured".to_string())?;
+        let model = provider_model_from_vault(vault.as_deref(), "openai")
+            .unwrap_or_else(|| "gpt-4o".to_string());
+        llm::spawn_openai_thread(key, model).map_err(|e| e.to_string())?
+    } else if provider == "gemini" {
+        let key = provider_key_from_vault(vault.as_deref(), "gemini")
+            .or_else(|| settings.api_key.clone())
+            .ok_or_else(|| "No Gemini API key configured".to_string())?;
+        let model = provider_model_from_vault(vault.as_deref(), "gemini")
+            .unwrap_or_else(|| "gemini-2.0-flash".to_string());
+        llm::spawn_gemini_thread(key, model).map_err(|e| e.to_string())?
+    } else if provider == "openai_compat" {
+        let key = provider_key_from_vault(vault.as_deref(), "openai_compat").unwrap_or_default();
+        let base_url = provider_base_url_from_vault(vault.as_deref(), "openai_compat")
+            .ok_or_else(|| "openai_compat requires a base_url in vault settings".to_string())?;
+        let model = provider_model_from_vault(vault.as_deref(), "openai_compat")
+            .ok_or_else(|| "openai_compat requires a default_model in vault settings".to_string())?;
+        llm::spawn_openai_compat_thread(key, base_url, model).map_err(|e| e.to_string())?
+    } else {
+        // Local llama.cpp path. In the lite build (no `local-llm`
+        // feature) this branch is replaced by an error so the rest of
+        // the function still compiles. Users on the lite build run
+        // local LLMs via Ollama through the openai_compat provider.
+        #[cfg(feature = "local-llm")]
+        {
+            let path = settings
+                .model_path
+                .clone()
+                .ok_or_else(|| "No model_path set in settings".to_string())?;
+            llm::spawn_inference_thread(&path, settings.gpu_layers, settings.ctx_size)
+                .map_err(|e| e.to_string())?
+        }
+        #[cfg(not(feature = "local-llm"))]
+        {
+            let _ = &settings;
+            return Err(
+                "This Forge build doesn't bundle local llama.cpp. \
+                 Pick an API provider (Anthropic/OpenAI/Gemini/Copilot) \
+                 or run Ollama and configure it via the openai_compat provider \
+                 (base_url http://localhost:11434/v1)."
+                    .to_string(),
+            );
+        }
     };
 
     let name = handle.model_name.clone();
     *state.inference.lock().unwrap() = Some(handle);
     Ok(ConnectResult { model_name: name })
+}
+
+// Lazy access to the new per-vault `VaultSettings` JSON. Avoids threading a
+// VaultSettings handle through AppState now — connect_inference is the only
+// caller that needs them and it does so once per chat session.
+fn read_vault_settings_raw(vault: Option<&Path>) -> Option<serde_json::Value> {
+    let v = vault?;
+    let path = v.join(".forge").join("settings.json");
+    let s = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn provider_key_from_vault(vault: Option<&Path>, provider: &str) -> Option<String> {
+    let v = read_vault_settings_raw(vault)?;
+    v.get("ai")?
+        .get("providers")?
+        .get(provider)?
+        .get("api_key")?
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn provider_model_from_vault(vault: Option<&Path>, provider: &str) -> Option<String> {
+    let v = read_vault_settings_raw(vault)?;
+    v.get("ai")?
+        .get("providers")?
+        .get(provider)?
+        .get("default_model")?
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn provider_base_url_from_vault(vault: Option<&Path>, provider: &str) -> Option<String> {
+    let v = read_vault_settings_raw(vault)?;
+    v.get("ai")?
+        .get("providers")?
+        .get(provider)?
+        .get("base_url")?
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// User-defined system prompt from vault settings. Empty / absent →
+/// agent falls back to default_system_prompt(). When present, REPLACES
+/// the default — users wanting tool-using behaviour keep that capability
+/// via the tool schemas (tool_schemas()) which are independent of the
+/// prompt; users who paste in a widget contract or domain prompt get
+/// exactly what they wrote without a noisy preamble.
+fn vault_system_prompt(vault: Option<&Path>) -> Option<String> {
+    let v = read_vault_settings_raw(vault)?;
+    v.get("system_prompt")?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -537,13 +669,39 @@ pub fn send_chat_message(
     let search_arc = std::sync::Arc::clone(&state.search);
 
     // Convert frontend history to LLM ChatMessages. The first turn must be
-    // the system prompt; if not present we synthesise one.
+    // the system prompt; if not present we synthesise one. User-defined
+    // prompt from vault settings wins over the built-in default.
+    //
+    // Skill cards from <vault>/.forge/skills/ are appended to the system
+    // prompt when their triggers match the user's most recent message.
+    // Capped at MAX_SKILLS_PER_TURN inside the skills module to keep the
+    // prompt bounded. Loading + matching here (per-turn) instead of
+    // session-start so newly-authored skills go live without reconnect.
     let mut messages: Vec<llm::ChatMessage> = Vec::with_capacity(history.len() + 1);
     let vault_name = vault
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "vault".into());
-    messages.push(llm::ChatMessage::system(crate::agent::default_system_prompt(&vault_name)));
+    let base_prompt = vault_system_prompt(Some(&vault))
+        .unwrap_or_else(|| crate::agent::default_system_prompt(&vault_name));
+    let last_user_msg = history
+        .iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.content.clone())
+        .unwrap_or_default();
+    let skills = crate::skills::load_skills(&vault);
+    let matched = crate::skills::select_skills(&skills, &last_user_msg);
+    if !matched.is_empty() {
+        eprintln!(
+            "[forge-skills] matched {}/{} skills for this turn: {:?}",
+            matched.len(),
+            skills.len(),
+            matched.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+    let system = crate::skills::assemble_prompt(&base_prompt, &matched);
+    messages.push(llm::ChatMessage::system(system));
     for turn in history {
         match turn.role.as_str() {
             "user" => messages.push(llm::ChatMessage::user(&turn.content)),
@@ -565,6 +723,8 @@ pub fn send_chat_message(
                 search: search_arc,
                 search_db_path,
                 search_index_path,
+                user_filename_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                last_write_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
             };
             let mut msgs = messages;
 
@@ -692,9 +852,6 @@ pub fn transcribe_audio(state: State<'_, AppState>, wav_bytes: Vec<u8>) -> Resul
 
 // ── Voice conversation mode ────────────────────────────────────────────
 
-fn home_path(p: &str) -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(p)
-}
 
 #[tauri::command]
 pub fn voice_start(state: State<'_, AppState>, window: Window) -> Result<(), String> {
@@ -709,18 +866,20 @@ pub fn voice_start_wake(state: State<'_, AppState>, window: Window) -> Result<()
 fn voice_start_impl(state: State<'_, AppState>, window: Window, use_wake: bool) -> Result<(), String> {
     let settings = state.settings.lock().unwrap().clone();
 
-    let whisper_bin = std::env::var("FORGE_WHISPER_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home_path(".forge/bin/whisper-cli"));
+    // Use the same resolver as push-to-talk + Settings → STT/TTS so the
+    // voice flow finds binaries the user actually installed via the UI
+    // (managed dir is ~/.local/share/forge/bin/, not ~/.forge/bin/).
+    let whisper_bin = binaries::resolve_whisper_cli()
+        .ok_or_else(|| "whisper-cli not installed. Settings → STT → Install whisper.cpp.".to_string())?;
     let whisper_model = settings.whisper_model_path.clone()
         .ok_or_else(|| "whisper_model_path missing in settings".to_string())?;
     let piper_bin = settings.piper_bin_path.clone()
-        .unwrap_or_else(|| home_path(".forge/bin/piper"));
+        .or_else(binaries::resolve_piper)
+        .ok_or_else(|| "piper not installed. Settings → TTS → Install piper.".to_string())?;
     let piper_voice = settings.piper_voice_path.clone()
-        .unwrap_or_else(|| home_path(".forge/models/piper/voice.onnx"));
+        .ok_or_else(|| "piper voice not picked. Settings → TTS → pick a voice.".to_string())?;
 
-    if !whisper_bin.exists() { return Err(format!("whisper-cli missing: {}", whisper_bin.display())); }
-    if !piper_bin.exists() { return Err(format!("piper missing: {}", piper_bin.display())); }
+    if !whisper_model.exists() { return Err(format!("whisper model missing: {}", whisper_model.display())); }
     if !piper_voice.exists() { return Err(format!("piper voice missing: {}", piper_voice.display())); }
 
     let vh = std::sync::Arc::clone(&state.voice);
@@ -756,12 +915,16 @@ fn voice_start_impl(state: State<'_, AppState>, window: Window, use_wake: bool) 
         wake_word,
     };
 
-    // Accumulate chat history across the session.
+    // Accumulate chat history across the session. Voice path mirrors the
+    // text path: user-defined system prompt from vault settings takes
+    // precedence over the agent default.
     let history: std::sync::Arc<std::sync::Mutex<Vec<crate::llm::ChatMessage>>> =
         std::sync::Arc::new(std::sync::Mutex::new({
             let vault_name = vault.file_name().map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "vault".into());
-            vec![crate::llm::ChatMessage::system(crate::agent::default_system_prompt(&vault_name))]
+            let system = vault_system_prompt(Some(&vault))
+                .unwrap_or_else(|| crate::agent::default_system_prompt(&vault_name));
+            vec![crate::llm::ChatMessage::system(system)]
         }));
     let history_closure = std::sync::Arc::clone(&history);
     let tools = crate::agent::tool_schemas();
@@ -798,6 +961,8 @@ fn voice_start_impl(state: State<'_, AppState>, window: Window, use_wake: bool) 
             search: std::sync::Arc::clone(&search_arc),
             search_db_path: search_db_path.clone(),
             search_index_path: search_index_path.clone(),
+            user_filename_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_write_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let (agent_tx, agent_rx) = std::sync::mpsc::channel::<crate::agent::AgentEvent>();
         let messages_clone: Vec<crate::llm::ChatMessage> = h.clone();
@@ -889,6 +1054,60 @@ pub fn stop_chat(_state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// ── LaTeX ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn compile_latex(path: String) -> Result<latex::LatexCompileResult, String> {
+    latex::compile(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn latex_status() -> Result<latex::LatexStatus, String> {
+    Ok(latex::engine_status())
+}
+
+/// Open a file in the OS-default plain-text editor. Bypasses file-type
+/// associations so a `.tex` opened via "Edit source" lands in a text
+/// editor (TextEdit / Notepad / xdg-mime text/plain handler), not in
+/// whatever LaTeX IDE the user has installed.
+#[tauri::command]
+pub fn open_in_text_editor(path: String) -> Result<(), String> {
+    use std::process::Command;
+    let os = std::env::consts::OS;
+    let result = match os {
+        "macos" => {
+            // `open -t` on macOS opens with the system's default plain
+            // text editor (usually TextEdit) regardless of file
+            // association for the given extension.
+            Command::new("open").args(["-t", &path]).spawn()
+        }
+        "windows" => Command::new("notepad.exe").arg(&path).spawn(),
+        _ => {
+            // Linux / BSD: prefer an editor we can be reasonably sure
+            // is plain-text. Try a short list of common GUI editors in
+            // order; fall back to xdg-open if none found. This avoids
+            // xdg-open picking a LaTeX IDE via `.tex` mime association.
+            let editors = [
+                "gedit",
+                "kate",
+                "gnome-text-editor",
+                "mousepad",
+                "xed",
+                "pluma",
+            ];
+            let mut spawned = None;
+            for ed in editors {
+                if let Ok(child) = Command::new(ed).arg(&path).spawn() {
+                    spawned = Some(Ok(child));
+                    break;
+                }
+            }
+            spawned.unwrap_or_else(|| Command::new("xdg-open").arg(&path).spawn())
+        }
+    };
+    result.map(|_| ()).map_err(|e| format!("open failed: {e}"))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn resolve_within_vault(vault: &Path, path: &Path) -> Result<PathBuf, String> {
@@ -910,4 +1129,223 @@ fn resolve_within_vault(vault: &Path, path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical)
+}
+
+// ── Copilot auth ──────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CopilotStatus {
+    pub signed_in: bool,
+    pub login: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CopilotPollResult {
+    Pending,
+    SlowDown,
+    Ok { login: Option<String> },
+    Denied,
+    Expired,
+    Other { message: String },
+    NoCode,
+}
+
+#[tauri::command]
+pub fn copilot_status() -> Result<CopilotStatus, String> {
+    let t = copilot::load_tokens();
+    Ok(CopilotStatus {
+        signed_in: t.github_token.is_some(),
+        login: t.github_login,
+    })
+}
+
+#[tauri::command]
+pub fn copilot_login_start(state: State<'_, AppState>) -> Result<copilot::DeviceCodeResponse, String> {
+    let resp = copilot::request_device_code()?;
+    let mut g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(resp.device_code.clone());
+    Ok(resp)
+}
+
+#[tauri::command]
+pub fn copilot_login_poll(state: State<'_, AppState>) -> Result<CopilotPollResult, String> {
+    let device_code = {
+        let g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+        match g.clone() {
+            Some(c) => c,
+            None => return Ok(CopilotPollResult::NoCode),
+        }
+    };
+    let res = copilot::poll_device_code(&device_code)?;
+    match res {
+        copilot::PollResult::Pending => Ok(CopilotPollResult::Pending),
+        copilot::PollResult::SlowDown => Ok(CopilotPollResult::SlowDown),
+        copilot::PollResult::Authorized { github_token } => {
+            copilot::finalize_auth(github_token)?;
+            // Clear pending code on success.
+            let mut g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+            *g = None;
+            let login = copilot::load_tokens().github_login;
+            Ok(CopilotPollResult::Ok { login })
+        }
+        copilot::PollResult::Denied => {
+            let mut g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+            *g = None;
+            Ok(CopilotPollResult::Denied)
+        }
+        copilot::PollResult::Expired => {
+            let mut g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+            *g = None;
+            Ok(CopilotPollResult::Expired)
+        }
+        copilot::PollResult::Other(msg) => Ok(CopilotPollResult::Other { message: msg }),
+    }
+}
+
+#[tauri::command]
+pub fn copilot_models() -> Result<Vec<copilot::CopilotModel>, String> {
+    copilot::list_models()
+}
+
+#[tauri::command]
+pub fn copilot_logout(state: State<'_, AppState>) -> Result<(), String> {
+    copilot::clear_tokens();
+    let mut g = state.copilot_pending.0.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
+    Ok(())
+}
+
+// ── Build capabilities ────────────────────────────────────────────────
+
+/// Reports which optional subsystems were compiled into this build.
+/// The frontend reads this on boot to decide whether to expose UI for
+/// the local LLM tab, the model-download manager, etc. Unknown future
+/// flags should default to `false` on the JS side.
+#[derive(serde::Serialize)]
+pub struct RuntimeCapabilities {
+    /// True if `llama-cpp-2` is linked in (i.e., the `local-llm`
+    /// Cargo feature was enabled at build time). When false, the
+    /// "Local GGUF" provider tab and model-download UI should be
+    /// hidden, and `connect_inference` returns an error if the user
+    /// somehow selects the local provider anyway.
+    pub local_llm: bool,
+}
+
+#[tauri::command]
+pub fn runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        local_llm: cfg!(feature = "local-llm"),
+    }
+}
+
+// ── Models catalog + downloads ────────────────────────────────────────
+
+#[tauri::command]
+pub fn list_models() -> Result<Vec<models::ModelInfo>, String> {
+    Ok(models::inventory())
+}
+
+#[tauri::command]
+pub fn start_model_download(
+    state: State<'_, AppState>,
+    window: Window,
+    id: String,
+) -> Result<(), String> {
+    models::start_download(window, Arc::clone(&state.downloads), id)
+}
+
+#[tauri::command]
+pub fn cancel_model_download(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    Ok(models::cancel_download(&state.downloads, &id))
+}
+
+#[tauri::command]
+pub fn delete_model(id: String) -> Result<bool, String> {
+    models::delete(&id)
+}
+
+#[tauri::command]
+pub fn detect_gpu() -> Result<models::GpuStatus, String> {
+    Ok(models::detect_gpu())
+}
+
+// ── External binaries (whisper-cli, piper) ────────────────────────────
+
+#[tauri::command]
+pub fn binary_status() -> Result<binaries::BinaryStatus, String> {
+    Ok(binaries::status())
+}
+
+fn spawn_binary_install(
+    state: &State<'_, AppState>,
+    window: Window,
+    id: &str,
+    install_fn: fn(Window, Arc<AtomicBool>),
+) -> Result<(), String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut g = state.binary_install.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((existing_id, _)) = g.as_ref() {
+            return Err(format!("install already running: {existing_id}"));
+        }
+        *g = Some((id.to_string(), Arc::clone(&cancel)));
+    }
+    let cancel_clone = Arc::clone(&cancel);
+    let slot = Arc::clone(&state.binary_install);
+    let id_owned = id.to_string();
+    std::thread::Builder::new()
+        .name(format!("forge-install-{id}"))
+        .spawn(move || {
+            install_fn(window, cancel_clone);
+            let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cur, _)) = g.as_ref() {
+                if cur == &id_owned { *g = None; }
+            }
+        })
+        .map_err(|e| format!("spawn install thread: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn install_whisper_cpp(state: State<'_, AppState>, window: Window) -> Result<(), String> {
+    spawn_binary_install(&state, window, "whisper-cli", binaries::install_whisper_cpp)
+}
+
+#[tauri::command]
+pub fn install_piper(state: State<'_, AppState>, window: Window) -> Result<(), String> {
+    spawn_binary_install(&state, window, "piper", binaries::install_piper)
+}
+
+#[tauri::command]
+pub fn cancel_binary_install(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    let g = state.binary_install.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cur, flag)) = g.as_ref() {
+        if cur == &id {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ── Links / backlinks / graph ─────────────────────────────────────────
+
+#[tauri::command]
+pub fn list_backlinks(state: State<'_, AppState>, target: String) -> Result<Vec<links::LinkHit>, String> {
+    let vault = state.vault_path.lock().unwrap().clone()
+        .ok_or_else(|| "no vault open".to_string())?;
+    let target_path = if Path::new(&target).is_absolute() {
+        PathBuf::from(&target)
+    } else {
+        vault.join(&target)
+    };
+    Ok(links::list_backlinks(&vault, &target_path))
+}
+
+#[tauri::command]
+pub fn link_graph(state: State<'_, AppState>) -> Result<links::LinkGraph, String> {
+    let vault = state.vault_path.lock().unwrap().clone()
+        .ok_or_else(|| "no vault open".to_string())?;
+    Ok(links::build_link_graph(&vault))
 }

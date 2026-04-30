@@ -7,16 +7,22 @@ description = "Rust-backend markdown editor with AI research agent"
 
 [lib]
 name = "forge_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop Tauri 2: the bin is what actually runs, so a plain rlib is
+# all we need. cdylib/staticlib are mobile artifacts (iOS/Android) and
+# would force PIE linking, which fails because nvcc-built CUDA objects
+# in libggml-cuda.a use absolute relocations against libc symbols
+# (R_X86_64_PC32 against `stderr`).
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,14 +39,23 @@ candle-transformers = "0.8"
 hf-hub = "0.5"
 tokenizers = "0.20"
 notify = "7"
-llama-cpp-2 = { version = "0.1", features = ["cuda"] }
+llama-cpp-2 = { version = "0.1", features = ["cuda"], optional = true }
 hound = "3"
 cpal = "0.15"
 rand = "0.8"
 byteorder = "1"
 webrtc-vad = "0.4"
 base64 = "0.22"
+portable-pty = "0.8"
 
 [features]
+default = []
+
 # Re-export tauri custom-protocol when building production bundle
 custom-protocol = ["tauri/custom-protocol"]
+
+# Bundle the local llama.cpp + CUDA inference runtime. Adds ~150-250 MB
+# to the binary. Without this, the lite build is ~80% smaller and users
+# run local LLMs via Ollama (over the openai_compat HTTP API). API
+# providers (Anthropic / OpenAI / Gemini / Copilot) work in both builds.
+local-llm = ["dep:llama-cpp-2"]

@@ -6,12 +6,23 @@
 
 pub mod agent;
 pub mod auth;
+pub mod binaries;
+pub mod chat;
 pub mod commands;
+pub mod copilot;
 pub mod embedder;
+pub mod gemini;
+pub mod latex;
+pub mod links;
 pub mod llm;
+pub mod models;
+pub mod openai;
+pub mod openai_compat;
 pub mod search;
 pub mod settings;
+pub mod skills;
 pub mod stt;
+pub mod terminal;
 pub mod voice;
 
 use std::sync::{Arc, Mutex};
@@ -28,6 +39,10 @@ pub struct AppState {
     pub whisper: Arc<stt::WhisperHandle>,
     pub mic: Arc<stt::MicHandle>,
     pub voice: Arc<voice::VoiceHandle>,
+    pub downloads: Arc<models::ActiveDownloads>,
+    pub copilot_pending: Arc<copilot::PendingAuth>,
+    /// Cancel flag for the in-flight binary install (whisper-cli or piper).
+    pub binary_install: Arc<Mutex<Option<(String, Arc<std::sync::atomic::AtomicBool>)>>>,
 }
 
 impl AppState {
@@ -42,16 +57,35 @@ impl AppState {
             whisper: Arc::new(stt::WhisperHandle::default()),
             mic: Arc::new(stt::MicHandle::default()),
             voice: Arc::new(voice::VoiceHandle::default()),
+            downloads: Arc::new(models::ActiveDownloads::default()),
+            copilot_pending: Arc::new(copilot::PendingAuth::default()),
+            binary_install: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK on Linux ships with conservative defaults: software
+    // compositing in many distros, no DMA-BUF zero-copy, and the GL
+    // backend off. Forge is paint-heavy (CodeMirror decorations, large
+    // markdown previews, streaming chat), so we force every available
+    // GPU path on. Mac (WKWebView) and Windows (WebView2) ignore these
+    // and GPU-composite by default. Must run before tauri::Builder so
+    // wry/webkit2gtk reads the values during webview init.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        std::env::set_var("WEBKIT_FORCE_COMPOSITING_MODE", "1");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "0");
+        std::env::set_var("WEBKIT_USE_GLES", "1");
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "0");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
@@ -78,6 +112,47 @@ pub fn run() {
             commands::voice_interrupt,
             commands::voice_set_muted,
             commands::voice_start_wake,
+            commands::compile_latex,
+            commands::latex_status,
+            commands::open_in_text_editor,
+            commands::copilot_status,
+            commands::copilot_login_start,
+            commands::copilot_login_poll,
+            commands::copilot_logout,
+            commands::copilot_models,
+            commands::list_models,
+            commands::start_model_download,
+            commands::cancel_model_download,
+            commands::delete_model,
+            commands::detect_gpu,
+            commands::runtime_capabilities,
+            commands::binary_status,
+            commands::install_whisper_cpp,
+            commands::install_piper,
+            commands::cancel_binary_install,
+            commands::list_backlinks,
+            commands::link_graph,
+            settings::get_app_settings,
+            settings::set_app_settings,
+            settings::get_vault_settings,
+            settings::set_vault_settings,
+            settings::migrate_vault_settings,
+            chat::save_chat,
+            chat::load_chat,
+            chat::list_chats,
+            chat::delete_chat,
+            chat::export_chat_as_note,
+            llm::test_anthropic,
+            llm::test_openai,
+            llm::test_gemini,
+            llm::test_copilot,
+            llm::test_openai_compat,
+            llm::list_provider_models,
+            terminal::spawn_terminal,
+            terminal::write_terminal,
+            terminal::resize_terminal,
+            terminal::kill_terminal,
+            terminal::list_terminals,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

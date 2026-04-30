@@ -1,0 +1,10 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 80" role="img" aria-label="Mission Forge">
+  
+  <g transform="translate(14, 18)">
+    <path class="mark-stroke" d="M 4 30 L 44 30 L 36 44 L 12 44 Z"></path>
+    <path class="mark-stroke" d="M 14 18 L 34 18 L 30 30 L 18 30 Z"></path>
+    <path class="mark-accent" d="M 24 6 L 24 14 M 20 10 L 28 10"></path>
+  </g>
+  <text x="72" y="52" class="wm">Mission <tspan class="wm-accent">Forge</tspan></text>
+</svg>

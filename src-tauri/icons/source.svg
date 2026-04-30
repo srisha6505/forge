@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#241c14"/>
+      <stop offset="100%" stop-color="#0d0908"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#fcd34d"/>
+      <stop offset="55%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <radialGradient id="ember" cx="50%" cy="100%" r="55%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.55"/>
+      <stop offset="60%" stop-color="#b45309" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#b45309" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+
+  <!-- Forge ember glow rising from the base -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#ember)"/>
+
+  <!-- F letterform — chunky geometric, slightly weighted at the base.
+       Coordinates picked so the center of mass sits visually centered
+       (the F's bottom-left foot anchors a heavier silhouette). -->
+  <g fill="url(#amber)">
+    <!-- Vertical stem -->
+    <rect x="276" y="220" width="148" height="584" rx="14" ry="14"/>
+    <!-- Top arm -->
+    <rect x="276" y="220" width="472" height="148" rx="14" ry="14"/>
+    <!-- Middle arm (shorter) -->
+    <rect x="276" y="466" width="368" height="138" rx="14" ry="14"/>
+  </g>
+
+  <!-- Tiny anvil spark — single dot at lower-right of F base, hints
+       at the forge metaphor without being literal. -->
+  <circle cx="780" cy="780" r="18" fill="#fcd34d" opacity="0.85"/>
+  <circle cx="780" cy="780" r="34" fill="#fcd34d" opacity="0.18" filter="url(#soft)"/>
+</svg>

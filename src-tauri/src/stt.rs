@@ -16,16 +16,14 @@ pub struct Whisper {
 
 impl Whisper {
     pub fn new(model_path: &Path) -> Result<Self, String> {
-        let binary = std::env::var("FORGE_WHISPER_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".forge/bin/whisper-cli")
-            });
-        if !binary.exists() {
-            return Err(format!("whisper-cli binary not found at {}. Set FORGE_WHISPER_BIN.", binary.display()));
-        }
+        // Single source of truth for binary lookup: env var → managed
+        // bin dir (~/.local/share/forge/bin/, where the in-app installer
+        // drops it) → legacy ~/.forge/bin/ → PATH. Keeping this in sync
+        // with binaries.rs so users who installed via Settings → STT
+        // don't see "binary not found" because of a path mismatch.
+        let binary = crate::binaries::resolve_whisper_cli().ok_or_else(|| {
+            "whisper-cli not found. Install it via Settings → STT, set FORGE_WHISPER_BIN, or put it on PATH.".to_string()
+        })?;
         if !model_path.exists() {
             return Err(format!("whisper model not found: {}", model_path.display()));
         }
@@ -136,13 +134,48 @@ impl MicSession {
             .name("forge-mic".into())
             .spawn(move || {
                 let host = cpal::default_host();
-                let device = match host.default_input_device() {
-                    Some(d) => d,
-                    None => { let _ = res_tx.send(Err("No input device".into())); return; }
-                };
-                let cfg = match device.default_input_config() {
-                    Ok(c) => c,
-                    Err(e) => { let _ = res_tx.send(Err(format!("input cfg: {e}"))); return; }
+                // Try the default device first. If its config-probe fails
+                // (common on Linux when pipewire's default device is in a
+                // weird state), fall back to walking every input device
+                // until one returns a valid config. Surface a list of
+                // attempted devices in the error so the user can pick
+                // a different default in their OS sound settings.
+                let mut tried: Vec<String> = Vec::new();
+                let mut picked: Option<(cpal::Device, cpal::SupportedStreamConfig)> = None;
+
+                if let Some(d) = host.default_input_device() {
+                    let name = d.name().unwrap_or_else(|_| "default".into());
+                    match d.default_input_config() {
+                        Ok(c) => picked = Some((d, c)),
+                        Err(e) => tried.push(format!("{name}: {e}")),
+                    }
+                }
+                if picked.is_none() {
+                    let devices = host.input_devices().ok();
+                    if let Some(it) = devices {
+                        for d in it {
+                            let name = d.name().unwrap_or_else(|_| "?".into());
+                            match d.default_input_config() {
+                                Ok(c) => { picked = Some((d, c)); break; }
+                                Err(e) => tried.push(format!("{name}: {e}")),
+                            }
+                        }
+                    }
+                }
+                let (device, cfg) = match picked {
+                    Some(p) => p,
+                    None => {
+                        let msg = if tried.is_empty() {
+                            "No input device available".to_string()
+                        } else {
+                            format!(
+                                "No usable input device. Tried: {}",
+                                tried.join("; ")
+                            )
+                        };
+                        let _ = res_tx.send(Err(msg));
+                        return;
+                    }
                 };
                 let input_rate = cfg.sample_rate().0;
                 let channels = cfg.channels();

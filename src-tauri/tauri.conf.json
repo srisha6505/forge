@@ -17,18 +17,42 @@
         "height": 900,
         "minWidth": 900,
         "minHeight": 600,
-        "decorations": true,
+        "decorations": false,
         "transparent": false,
-        "resizable": true
+        "resizable": true,
+        "dragDropEnabled": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": []
+    "targets": ["deb", "appimage"],
+    "category": "Productivity",
+    "shortDescription": "AI-augmented markdown editor with interactive widgets",
+    "longDescription": "Forge is a desktop markdown editor that turns notes into interactive lessons. Generate live HTML/JS widgets in your prose, run local LLMs, embed math and code, and keep everything as plain Markdown in your vault.",
+    "copyright": "Copyright (c) 2026 Forge",
+    "publisher": "Forge",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "section": "editors"
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
   }
 }

@@ -12,6 +12,11 @@
     "dialog:default",
     "dialog:allow-open",
     "fs:default",
-    "shell:default"
+    "fs:allow-copy-file",
+    "fs:scope-home-recursive",
+    "fs:scope-temp-recursive",
+    "dialog:allow-save",
+    "shell:default",
+    "notification:default"
   ]
 }

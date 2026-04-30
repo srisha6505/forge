@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Headphones, PhoneOff, Pause, Play, Radio } from "lucide-react";
+import { Headphones, PhoneOff, Pause, Play } from "lucide-react";
 import {
   voiceStart,
-  voiceStartWake,
   voiceStop,
   voiceInterrupt,
   voiceSetMuted,
@@ -124,20 +123,6 @@ export function ConversationToggle({ disabled }: Props) {
     try { await voiceSetMuted(next); } catch (e) { console.error(e); }
   };
 
-  const startWake = async () => {
-    if (disabled || state !== "off") return;
-    abortRef.current = false;
-    playingRef.current = false;
-    audioQueueRef.current = [];
-    setMuted(false);
-    try {
-      await voiceStartWake();
-      setState("listening");
-    } catch (e) {
-      alert(`Wake-word start failed: ${e}`);
-    }
-  };
-
   const hint = state === "wake_active" ? "Riva listening…"
     : state === "listening" ? "Say \"Riva\" to activate"
     : state === "muted" ? "Muted"
@@ -159,18 +144,6 @@ export function ConversationToggle({ disabled }: Props) {
         <span className="text-[11px] text-[var(--text-muted)] self-center whitespace-nowrap" style={{ marginLeft: 4 }}>
           {hint}
         </span>
-      )}
-      {state === "off" && (
-        <button
-          type="button"
-          onClick={startWake}
-          disabled={disabled}
-          title='Wake-word mode ("Riva ...")'
-          aria-label="Wake-word mode"
-          className="voice-input-btn"
-        >
-          <Radio size={16} />
-        </button>
       )}
       {state !== "off" && (
         <button

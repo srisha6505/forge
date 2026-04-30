@@ -2,6 +2,12 @@
 target/
 src-tauri/target/
 src-tauri/gen/
+
+# Claude Code project state — settings.json + log-turn.sh are committed
+# (team-shared Stop hook); conv-log + lock files + worktrees are ephemeral.
+/.claude/conv-log.md
+/.claude/scheduled_tasks.lock
+/.claude/worktrees/
 # Bundled native libs at the workspace root only (NOT src/lib, which is React).
 /lib/
 *.AppImage
@@ -18,6 +24,9 @@ dist/
 # IDE
 .vscode/
 .idea/
+
+# Claude Code agent worktrees
+.claude/worktrees/
 
 # Legacy GPUI layout, kept alongside during migration
 src-old/

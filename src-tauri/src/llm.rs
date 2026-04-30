@@ -85,6 +85,13 @@ pub struct InferenceHandle {
 }
 
 impl InferenceHandle {
+    /// Construct an InferenceHandle from an already-spawned thread's request
+    /// sender. Used by per-provider modules (openai/gemini/copilot) that own
+    /// their own threads but expose the unified handle to the agent loop.
+    pub fn from_sender(tx: mpsc::Sender<InferenceRequest>, model_name: String) -> Self {
+        Self { tx, model_name }
+    }
+
     /// Send a generation request. Returns a receiver for streaming events.
     pub fn generate(
         &self,
@@ -104,6 +111,12 @@ impl InferenceHandle {
 
 /// Spawn a dedicated OS thread that owns the LlamaContext and processes
 /// requests sequentially. Returns a handle for sending requests.
+///
+/// Compiled out of the lite build. Without `local-llm`, the entry point
+/// in `commands::connect_inference` short-circuits with a clear error
+/// telling the user to use Ollama (over openai_compat) or an API
+/// provider. Saves ~150-250 MB of bundled llama.cpp + CUDA libraries.
+#[cfg(feature = "local-llm")]
 pub fn spawn_inference_thread(
     model_path: &Path,
     n_gpu_layers: u32,
@@ -138,6 +151,38 @@ pub fn spawn_inference_thread(
     Ok(InferenceHandle { tx, model_name })
 }
 
+/// Process-wide singleton llama backend. `LlamaBackend::init()` panics
+/// the second time it's called (returns `BackendAlreadyInitialized`)
+/// because llama.cpp's global ggml init can only happen once per process.
+/// We hit this whenever the user switches models or reconnects, since
+/// each connect spawns a fresh inference thread.
+///
+/// Hold the backend in a OnceLock and lend a `&'static LlamaBackend` to
+/// every inference thread. The backend is Send+Sync; loading models and
+/// creating contexts only borrow it.
+#[cfg(feature = "local-llm")]
+fn shared_backend()
+    -> Result<&'static llama_cpp_2::llama_backend::LlamaBackend, String>
+{
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use std::sync::OnceLock;
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    match LlamaBackend::init() {
+        Ok(b) => {
+            // get_or_init the cell. If a concurrent thread beat us to it
+            // (rare — both initialize the same global ggml state), fall
+            // back to whatever is now there.
+            let _ = BACKEND.set(b);
+            Ok(BACKEND.get().expect("backend just set"))
+        }
+        Err(e) => Err(format!("Backend init failed: {e}")),
+    }
+}
+
+#[cfg(feature = "local-llm")]
 fn inference_loop(
     model_path: PathBuf,
     n_gpu_layers: u32,
@@ -145,20 +190,19 @@ fn inference_loop(
     rx: mpsc::Receiver<InferenceRequest>,
 ) {
     use llama_cpp_2::context::params::LlamaContextParams;
-    use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel, Special};
     use llama_cpp_2::sampling::LlamaSampler;
 
-    // Initialize backend.
-    let backend = match LlamaBackend::init() {
+    // Use the process-wide backend (initialized on first spawn, reused
+    // on every subsequent spawn).
+    let backend = match shared_backend() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[forge-llm] Backend init failed: {e}");
-            // Drain requests with error.
+            eprintln!("[forge-llm] {e}");
             for req in rx.iter() {
-                let _ = req.response_tx.send(InferenceEvent::Error(format!("Backend init failed: {e}")));
+                let _ = req.response_tx.send(InferenceEvent::Error(e.clone()));
             }
             return;
         }
@@ -166,7 +210,7 @@ fn inference_loop(
 
     // Load model.
     let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-    let model = match LlamaModel::load_from_file(&backend, &model_path, &model_params) {
+    let model = match LlamaModel::load_from_file(backend, &model_path, &model_params) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("[forge-llm] Model load failed: {e}");
@@ -181,7 +225,7 @@ fn inference_loop(
 
     // Create context.
     let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZero::new(n_ctx));
-    let mut ctx = match model.new_context(&backend, ctx_params) {
+    let mut ctx = match model.new_context(backend, ctx_params) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[forge-llm] Context creation failed: {e}");
@@ -200,6 +244,7 @@ fn inference_loop(
     eprintln!("[forge-llm] Inference thread exiting.");
 }
 
+#[cfg(feature = "local-llm")]
 fn process_request(
     model: &llama_cpp_2::model::LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -266,22 +311,40 @@ fn process_request(
     }
 
     // Generate tokens.
-    // Gemma 4 recommended: temp=1.0, top_p=0.95, top_k=64
-    // dist() at the end picks a token from filtered candidates.
+    //
+    // Sampler tuned for tool-using agent work, NOT free-form chat.
+    // Gemma 4's published creative defaults (temp=1.0, top_p=0.95) sample
+    // low-probability tokens often — including the `<turn|>` end-of-turn
+    // token mid-content. Result: tool-call args truncate randomly. Same
+    // model at temp ≈ 0 produces full output reliably (verified against
+    // tarang/llama-server which uses --temp 0).
+    //
+    // Greedy (temp=0) follows the model's most likely path through the
+    // chat template, which for trained tool-call patterns means
+    // emitting the close tag only after the content is genuinely
+    // complete. Trade: less variety for free-form prose. We accept that
+    // — Forge is an agent harness, not a creative writing tool. Free-
+    // form prose generation still works fine because greedy doesn't
+    // mean broken, just deterministic.
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(42);
     let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(1.0),
-        LlamaSampler::top_k(64),
-        LlamaSampler::top_p(0.95, 1),
+        LlamaSampler::temp(0.0),
+        LlamaSampler::top_k(1),
         LlamaSampler::dist(seed),
     ]);
 
     let mut full_output = String::new(); // accumulate everything for tool call detection
     let mut n_decoded = 0usize;
-    let max_gen = (n_ctx - tokens.len()).min(4096);
+    // Cap at 8192 (was 4096). Gemma 4 E4B can produce long markdown notes
+    // (intro + explanation + math + widget) and emit `<|channel>` thinking
+    // tokens that eat into the budget. With a 1000-token system prompt +
+    // ~1500 tokens of injected tool definitions, plus user message, we're
+    // around 2700 prompt tokens. 8192 generation cap leaves headroom for
+    // ~1000 tokens of thinking AND a full tool_call with 4-6KB of content.
+    let max_gen = (n_ctx - tokens.len()).min(8192);
     let mut pos = tokens.len() as i32;
     let mut in_thinking = false;
     let mut thinking_buf = String::new();
@@ -301,6 +364,33 @@ fn process_request(
 
         let piece = model.token_to_str(token, Special::Tokenize)
             .unwrap_or_default();
+
+        // Backstop: llama-cpp-2 v0.1's `is_eog_token` only checks the
+        // primary eos_token_id (Gemma 4 = `<turn|>`, id=106). The model's
+        // vocab has many other turn-ending special tokens that get rendered
+        // as literal text when emitted. Token IDs verified by reading the
+        // GGUF directly:
+        //   id=1   `<eos>`            (type=NORMAL, leaks as text)
+        //   id=49  `<tool_call|>`     (closes tool call, MUST stop here or
+        //                              model rambles into thinking after)
+        //   id=50  `<|tool_response>` (control)
+        //   id=51  `<tool_response|>` (control)
+        //   id=106 `<turn|>`          (already caught by is_eog_token)
+        // Without this guard the model emits `<tool_call|>` to end its
+        // tool call, then keeps generating thinking-channel text that eats
+        // budget and confuses the parser. Stop on rendered-text match.
+        let stripped = piece.trim();
+        if stripped == "<eos>"
+            || stripped == "<tool_call|>"
+            || stripped == "<|tool_response>"
+            || stripped == "<tool_response|>"
+            || stripped == "<turn|>"
+            || stripped == "</s>"
+            || stripped == "<|end|>"
+            || stripped == "<|endoftext|>"
+        {
+            break;
+        }
 
         full_output.push_str(&piece);
 
@@ -411,6 +501,7 @@ fn process_request(
 
 // ── Prompt formatting ──
 
+#[cfg(feature = "local-llm")]
 fn format_prompt(
     model: &llama_cpp_2::model::LlamaModel,
     messages: &[ChatMessage],
@@ -465,6 +556,20 @@ fn format_prompt(
         .map_err(|e| format!("No chat template in model: {e}"))?;
 
     // Try with tools first, fall back to without.
+    //
+    // NOTE on enable_thinking: llama-cpp-2 v0.1.143's binding signature is
+    // `apply_chat_template_with_tools_oaicompat(tmpl, msgs, tools_json,
+    // json_schema, add_gen_prompt)`. The 4th param is JSON schema for
+    // grammar-constrained output, NOT chat_template_kwargs. The binding
+    // does NOT expose chat-template kwargs — to disable thinking like
+    // tarang's `--chat-template-kwargs '{"enable_thinking":false}'`, we
+    // would need to render the Jinja template ourselves (e.g. minijinja).
+    // For Gemma 4 specifically, inspecting the GGUF chat template shows
+    // `<|think|>` is only injected if enable_thinking is explicitly true,
+    // so the default (undefined) already behaves like enable_thinking=false.
+    // The thinking we still see is from the model's training emitting
+    // `<|channel>...<channel|>` blocks unprompted; those are stripped at
+    // streaming-time below, not via the template. Pass None for json_schema.
     if !tools.is_empty() {
         let tools_json = serde_json::to_string(tools).unwrap_or("[]".into());
         match model.apply_chat_template_with_tools_oaicompat(
@@ -496,6 +601,7 @@ fn format_prompt(
 
 /// Fallback: inject tool definitions into the system prompt when the model's
 /// chat template doesn't natively support tools.
+#[cfg(feature = "local-llm")]
 fn format_prompt_with_injected_tools(
     model: &llama_cpp_2::model::LlamaModel,
     tmpl: &llama_cpp_2::model::LlamaChatTemplate,
@@ -590,33 +696,55 @@ impl ChatRole {
 
 fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
     // Pattern 0: Raw Gemma tool call without tags: "call:tool_name{...}"
-    // We need a complete call (balanced braces).
-    // Normalize Gemma's special quote token rendering first.
-    let normalized = text.replace("<|\"|>", "\"").replace("<|'|>", "'");
-    if let Some(call_start) = normalized.find("call:") {
-        let after = &normalized[call_start + "call:".len()..];
+    // Brace-balance the args, but TRACK STRING BOUNDARIES so braces inside
+    // string values don't trip the balancer. Gemma emits string values
+    // wrapped in `<|"|>...<|"|>` (special token id=52). When user content
+    // has its own `{` and `}` (HTML widgets, JS arrow functions, JSON), the
+    // raw `}` tokens would otherwise close the tool call prematurely.
+    //
+    // We match the literal byte sequence `<|"|>` (5 bytes) on the RAW text —
+    // do not normalize it to `"` first. Generic `"` chars inside content
+    // (HTML attrs etc.) are NOT delimiters; only the `<|"|>` token is.
+    if let Some(call_start) = text.find("call:") {
+        let after = &text[call_start + "call:".len()..];
         if let Some(brace_start) = after.find('{') {
-            // Find balanced closing brace.
             let bytes = after.as_bytes();
             let mut depth = 0i32;
             let mut end: Option<usize> = None;
-            for (i, &b) in bytes.iter().enumerate().skip(brace_start) {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
+            let mut in_string = false;
+            let mut i = brace_start;
+            while i < bytes.len() {
+                // Toggle on the literal 5-byte sequence `<|"|>`.
+                if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"<|\"|>" {
+                    in_string = !in_string;
+                    i += 5;
+                    continue;
                 }
+                if !in_string {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
             }
             if let Some(end_pos) = end {
-                let candidate = &after[..=end_pos];
-                eprintln!("[forge-llm] raw call: tool_call content: {:?}", candidate);
-                if let Some(tc) = parse_gemma_tool_call(candidate) {
+                // Pass the RAW candidate (with <|"|> markers intact) to the
+                // strict parser. Normalizing here would erase the only
+                // reliable string boundary and force the parser to fall back
+                // to the legacy keyword-anchored scanner — which is exactly
+                // the path that mistook `data=${{...}}` (JS template literal
+                // inside widget HTML) for a new `data` arg key.
+                let candidate_raw = &after[..=end_pos];
+                eprintln!("[forge-llm] raw call: tool_call content: {:?}", candidate_raw);
+                if let Some(tc) = parse_gemma_tool_call(candidate_raw) {
                     eprintln!("[forge-llm] parse_gemma_tool_call (raw) result: {:?}", (&tc.name, &tc.arguments));
                     return Some(tc);
                 }
@@ -636,35 +764,43 @@ fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
             .or_else(|| after.find("<|tool_call|>").map(|p| (p, "<|tool_call|>".len())))
             .or_else(|| after.find("<eos>").map(|p| (p, "<eos>".len())));
 
+        // CRITICAL: only treat the call as complete when we actually see a
+        // closing tag. The streaming parser is called after EVERY emitted
+        // token, so an `ends_with(')')` heuristic fires the moment the model
+        // emits text containing a parenthetical (e.g., "the sampling rate
+        // ($f_s$)"), exits the generation loop, and writes a truncated file.
+        // This was the root cause of every Nyquist truncation: the model
+        // wasn't stopping early — we were stopping IT early.
         let content = if let Some((end, _)) = end_pos {
             after[..end].trim()
-        } else if after.trim().ends_with(')') || after.trim().ends_with('}') {
-            after.trim()
         } else {
+            // No close tag yet → incomplete tool call, let generation continue.
             ""
         };
 
         if !content.is_empty() {
-            // Clean Gemma's special quote tokens: <|"|> -> "
-            let cleaned = content.replace("<|\"|>", "\"").replace("<|'|>", "'");
-            let cleaned = cleaned.trim();
+            let trimmed = content.trim();
+            eprintln!("[forge-llm] raw tool_call content: {:?}", trimmed);
 
-            eprintln!("[forge-llm] raw tool_call content: {:?}", cleaned);
-
-            // Gemma format: call:tool_name{key:value, ...}
-            if cleaned.starts_with("call:") {
-                let after_call = &cleaned["call:".len()..];
+            // Gemma format: call:tool_name{key:<|"|>value<|"|>, ...}
+            // Pass RAW (un-normalized) text — keep <|"|> markers intact so the
+            // strict state-machine parser can use them as string boundaries.
+            if trimmed.starts_with("call:") {
+                let after_call = &trimmed["call:".len()..];
                 let parsed = parse_gemma_tool_call(after_call);
                 eprintln!("[forge-llm] parse_gemma_tool_call result: {:?}", parsed.as_ref().map(|t| (&t.name, &t.arguments)));
                 return parsed;
             }
 
-            // Try as JSON.
+            // Below paths are for non-Gemma formats (plain JSON, function-call
+            // syntax). These don't use <|"|>, so normalization is safe here.
+            let cleaned = trimmed.replace("<|\"|>", "\"").replace("<|'|>", "'");
+            let cleaned = cleaned.trim();
+
             if let Some(tc) = parse_tool_json(cleaned) {
                 eprintln!("[forge-llm] parse_tool_json result: name={}, args={}", tc.name, tc.arguments);
                 return Some(tc);
             }
-            // Try function-call syntax.
             for tool_name in KNOWN_TOOLS {
                 if cleaned.starts_with(tool_name) {
                     let fn_args = &cleaned[tool_name.len()..];
@@ -756,26 +892,204 @@ const KNOWN_TOOLS: &[&str] = &[
     "web_search",
 ];
 
-/// Parse Gemma 4 native tool call format: tool_name{key:"value", key2:"value2"}
-/// From traced output: call:search_vault{query:"training_report"}
+/// Parse Gemma 4 native tool call format: tool_name{key:<|"|>value<|"|>, key2:<|"|>value2<|"|>}
+///
+/// Gemma's chat template emits string values delimited by the special token
+/// `<|"|>` (id=52, 5 raw bytes). That marker is the ONLY reliable string
+/// boundary — regular `"` chars frequently appear inside content (HTML attrs,
+/// JS strings) and must NOT be treated as delimiters. This parser keeps the
+/// raw markers intact and runs a proper state-machine over the bytes:
+///
+///   - Outside any string: `{` increments depth, `}` decrements, `,` separates
+///     args, `key:` or `key=` introduces a value.
+///   - Inside `<|"|>...<|"|>`: every byte is content. No keyword matching, no
+///     brace counting, no terminator detection. This is what makes the parser
+///     robust to widget code that contains `data=`, `}`, `"`, etc.
+///
+/// On any failure we fall back to the legacy heuristic parsers, which handle
+/// rendered/normalized text (e.g., previous-turn tool calls in conversation
+/// history where `<|"|>` has already been collapsed to `"`).
 fn parse_gemma_tool_call(s: &str) -> Option<ToolCall> {
-    // Format: tool_name{key:value, ...}
     let brace = s.find('{')?;
     let name = s[..brace].trim().to_string();
-    let inner = &s[brace + 1..];
-    let inner = inner.rsplit_once('}').map(|(before, _)| before).unwrap_or(inner);
+    let after_open = &s[brace + 1..];
 
-    // Try the key-anchored parser first (robust against unescaped inner
-    // quotes in string values). Fall back to the state-machine parser if
-    // the anchored parser cannot find any known keys.
+    // Strict path: use the raw <|"|>-aware state machine first.
+    if let Some(arguments) = parse_gemma_args_strict(after_open) {
+        return Some(ToolCall { id: new_call_id(), name, arguments });
+    }
+
+    // Fallback for already-normalized text (no <|"|> markers left).
+    let inner = after_open.rsplit_once('}').map(|(before, _)| before).unwrap_or(after_open);
     let arguments = parse_kv_anchored(inner, &name)
         .or_else(|| parse_kv_map(inner))?;
+    Some(ToolCall { id: new_call_id(), name, arguments })
+}
 
-    Some(ToolCall {
-        id: new_call_id(),
-        name,
-        arguments,
-    })
+/// Strict, string-aware parser for Gemma's args body.
+///
+/// Input: bytes immediately AFTER the opening `{` of `call:tool{...`. The
+/// closing `}` (and anything after) is found by this function while honoring
+/// `<|"|>` string boundaries — so a `}` inside a string value (widget JS,
+/// nested JSON in content) does NOT close the args.
+///
+/// Returns None if no balanced close is found yet (caller should keep
+/// generating). Once a close IS found, splits on top-level commas and parses
+/// each `key:value` or `key=value` pair with the same string awareness.
+fn parse_gemma_args_strict(after_open: &str) -> Option<serde_json::Value> {
+    const STR_TOK: &[u8] = b"<|\"|>";   // 5 bytes
+    const STR_TOK_SQ: &[u8] = b"<|'|>"; // single-quoted variant
+
+    // Phase 1: find the balanced closing `}` while tracking string state.
+    let bytes = after_open.as_bytes();
+    let mut depth: i32 = 1;
+    let mut in_str = false;
+    let mut sq_in_str = false;
+    let mut i = 0;
+    let mut close: Option<usize> = None;
+    while i < bytes.len() {
+        if !sq_in_str && i + STR_TOK.len() <= bytes.len() && &bytes[i..i + STR_TOK.len()] == STR_TOK {
+            in_str = !in_str;
+            i += STR_TOK.len();
+            continue;
+        }
+        if !in_str && i + STR_TOK_SQ.len() <= bytes.len() && &bytes[i..i + STR_TOK_SQ.len()] == STR_TOK_SQ {
+            sq_in_str = !sq_in_str;
+            i += STR_TOK_SQ.len();
+            continue;
+        }
+        if !in_str && !sq_in_str {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let end = close?;
+    let body = &after_open[..end];
+
+    // Phase 2: split body into top-level key/value pairs at commas that are
+    // OUTSIDE any string. Then parse each pair the same way.
+    let pairs = split_top_level_commas(body);
+    let mut map = serde_json::Map::new();
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() { continue; }
+        let (key, raw_val) = split_key_value_string_aware(pair)?;
+        let key = key.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string();
+        if key.is_empty() { continue; }
+        let value = parse_gemma_value(raw_val.trim());
+        map.insert(key, value);
+    }
+    if map.is_empty() { None } else { Some(serde_json::Value::Object(map)) }
+}
+
+/// Split `body` on commas that are OUTSIDE any `<|"|>...<|"|>` string and
+/// outside any nested `{...}` (also string-aware).
+fn split_top_level_commas(body: &str) -> Vec<&str> {
+    const STR_TOK: &[u8] = b"<|\"|>";
+    const STR_TOK_SQ: &[u8] = b"<|'|>";
+    let bytes = body.as_bytes();
+    let mut in_str = false;
+    let mut sq_in_str = false;
+    let mut depth: i32 = 0;
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !sq_in_str && i + STR_TOK.len() <= bytes.len() && &bytes[i..i + STR_TOK.len()] == STR_TOK {
+            in_str = !in_str;
+            i += STR_TOK.len();
+            continue;
+        }
+        if !in_str && i + STR_TOK_SQ.len() <= bytes.len() && &bytes[i..i + STR_TOK_SQ.len()] == STR_TOK_SQ {
+            sq_in_str = !sq_in_str;
+            i += STR_TOK_SQ.len();
+            continue;
+        }
+        if !in_str && !sq_in_str {
+            match bytes[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(&body[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out.push(&body[start..]);
+    out
+}
+
+/// Split `pair` on the first `:` or `=` that's outside any string.
+fn split_key_value_string_aware(pair: &str) -> Option<(&str, &str)> {
+    const STR_TOK: &[u8] = b"<|\"|>";
+    const STR_TOK_SQ: &[u8] = b"<|'|>";
+    let bytes = pair.as_bytes();
+    let mut in_str = false;
+    let mut sq_in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !sq_in_str && i + STR_TOK.len() <= bytes.len() && &bytes[i..i + STR_TOK.len()] == STR_TOK {
+            in_str = !in_str;
+            i += STR_TOK.len();
+            continue;
+        }
+        if !in_str && i + STR_TOK_SQ.len() <= bytes.len() && &bytes[i..i + STR_TOK_SQ.len()] == STR_TOK_SQ {
+            sq_in_str = !sq_in_str;
+            i += STR_TOK_SQ.len();
+            continue;
+        }
+        if !in_str && !sq_in_str && (bytes[i] == b':' || bytes[i] == b'=') {
+            return Some((&pair[..i], &pair[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a single Gemma value: `<|"|>...<|"|>` string, bare scalar, or nested.
+///
+/// For string values: strip the `<|"|>` markers and return the bytes between
+/// them VERBATIM. The model is responsible for emitting valid file content;
+/// our job is to deliver those bytes to disk unchanged. No escape decoding,
+/// no escape encoding, no sanitization. If the model writes a real newline,
+/// the file gets a real newline. If the model writes the literal two chars
+/// `\` and `n`, the file gets those two chars. We don't second-guess.
+fn parse_gemma_value(raw: &str) -> serde_json::Value {
+    let raw = raw.trim();
+    if let Some(stripped) = raw.strip_prefix("<|\"|>").and_then(|s| s.strip_suffix("<|\"|>")) {
+        return serde_json::Value::String(stripped.to_string());
+    }
+    if let Some(stripped) = raw.strip_prefix("<|'|>").and_then(|s| s.strip_suffix("<|'|>")) {
+        return serde_json::Value::String(stripped.to_string());
+    }
+    // Already-normalized text (no special markers left): take outer quotes off if present.
+    if raw.len() >= 2 {
+        let b = raw.as_bytes();
+        let f = b[0]; let l = b[b.len() - 1];
+        if (f == b'"' || f == b'\'') && f == l {
+            return serde_json::Value::String(raw[1..raw.len() - 1].to_string());
+        }
+    }
+    // Bare scalars
+    if let Ok(n) = raw.parse::<i64>() { return serde_json::Value::Number(n.into()); }
+    if let Ok(n) = raw.parse::<f64>() { if let Some(num) = serde_json::Number::from_f64(n) { return serde_json::Value::Number(num); } }
+    if raw == "true" { return serde_json::Value::Bool(true); }
+    if raw == "false" { return serde_json::Value::Bool(false); }
+    if raw == "null" { return serde_json::Value::Null; }
+    serde_json::Value::String(raw.to_string())
 }
 
 /// Parse Gemma-style function call: tool_name(key:"value", key2:"value2")
@@ -1535,4 +1849,406 @@ fn anthropic_request(
     }
 
     let _ = tx.send(InferenceEvent::Done);
+}
+
+// ── GitHub Copilot ─────────────────────────────────────────────────────
+
+/// Spawn a background thread that serves requests via the Copilot
+/// /chat/completions endpoint (OpenAI-compatible). Tool calls are routed
+/// through the shared openai chat-stream helper, so `tool_calls` deltas
+/// from Copilot become real `InferenceEvent::ToolUse` events.
+/// Token refresh is handled per-request by copilot::get_copilot_token.
+pub fn spawn_copilot_thread(model: &str) -> Result<InferenceHandle, String> {
+    let (tx, rx) = mpsc::channel::<InferenceRequest>();
+    let model = model.to_string();
+    let model_name = model.clone();
+
+    std::thread::Builder::new()
+        .name("forge-copilot".into())
+        .spawn(move || {
+            eprintln!("[forge-copilot] thread started, model: {model}");
+            for req in rx.iter() {
+                let resp_tx = req.response_tx.clone();
+                let token = match crate::copilot::get_copilot_token() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = resp_tx.send(InferenceEvent::Error(format!("copilot token: {e}")));
+                        let _ = resp_tx.send(InferenceEvent::Done);
+                        continue;
+                    }
+                };
+                // Copilot expects vscode-style editor headers + intent.
+                let extra_headers: Vec<(&str, String)> = vec![
+                    ("Editor-Version", "vscode/1.95.0".into()),
+                    ("Editor-Plugin-Version", "copilot-chat/0.22.0".into()),
+                    ("Copilot-Integration-Id", "vscode-chat".into()),
+                    ("OpenAI-Intent", "conversation-panel".into()),
+                ];
+                let cfg = crate::openai::ChatRequestConfig {
+                    url: "https://api.githubcopilot.com/chat/completions",
+                    auth_bearer: &token,
+                    model: &model,
+                    extra_headers: &extra_headers,
+                };
+                crate::openai::run_chat_stream(&cfg, &req, &resp_tx);
+            }
+        })
+        .map_err(|e| format!("Failed to spawn Copilot thread: {e}"))?;
+
+    Ok(InferenceHandle::from_sender(tx, model_name))
+}
+
+// ── OpenAI / OpenAI-compat / Gemini ──────────────────────────────────
+
+/// Spawn a chat thread that talks to OpenAI directly.
+pub fn spawn_openai_thread(api_key: String, model: String) -> Result<InferenceHandle, String> {
+    crate::openai::spawn_thread(api_key, None, model)
+}
+
+/// Spawn a chat thread for any OpenAI-compatible endpoint (OpenRouter,
+/// Ollama, LM Studio, llama-server, Jan, etc.).
+pub fn spawn_openai_compat_thread(
+    api_key: String,
+    base_url: String,
+    model: String,
+) -> Result<InferenceHandle, String> {
+    crate::openai::spawn_thread(api_key, Some(base_url), model)
+}
+
+/// Spawn a chat thread that talks to Google Gemini's generateContent
+/// streaming endpoint.
+pub fn spawn_gemini_thread(api_key: String, model: String) -> Result<InferenceHandle, String> {
+    crate::gemini::spawn_thread(api_key, model)
+}
+
+// ── Provider catalogue + capability discovery (Phase 3) ────────────────
+//
+// Public API: every supported provider gets a `test_<provider>` Tauri
+// command that validates auth, lists models, and reports capability
+// metadata. Results are cached for 24 h in the user's config dir under
+// `provider-models.json` so settings reopens don't re-hit endpoints.
+
+/// Per-model capability metadata used by the routing slot picker and the
+/// context-window planner. Defaults are intentionally permissive on
+/// `supports_tools` because most modern chat models do support tool use.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderCapabilities {
+    #[serde(default)]
+    pub context_window: u32,
+    #[serde(default)]
+    pub max_output: u32,
+    #[serde(default)]
+    pub tokenizer_kind: String,
+    #[serde(default)]
+    pub supports_caching: bool,
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModel {
+    pub id: String,
+    pub display_name: String,
+    pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTestResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub models: Vec<ProviderModel>,
+}
+
+const CACHE_FILENAME: &str = "provider-models.json";
+const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+const ANTHROPIC_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModels {
+    ts: u64,
+    models: Vec<ProviderModel>,
+}
+
+fn cache_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("forge")
+        .join(CACHE_FILENAME)
+}
+
+fn cache_key(provider: &str, base_url: Option<&str>) -> String {
+    format!("{}|{}", provider, base_url.unwrap_or(""))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_cache() -> std::collections::HashMap<String, CachedModels> {
+    std::fs::read_to_string(cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_cache(map: &std::collections::HashMap<String, CachedModels>) {
+    let path = cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(map) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+fn cache_get(provider: &str, base_url: Option<&str>) -> Option<Vec<ProviderModel>> {
+    let map = read_cache();
+    let entry = map.get(&cache_key(provider, base_url))?;
+    if now_secs().saturating_sub(entry.ts) < CACHE_TTL_SECS {
+        Some(entry.models.clone())
+    } else {
+        None
+    }
+}
+
+fn cache_put(provider: &str, base_url: Option<&str>, models: &[ProviderModel]) {
+    let mut map = read_cache();
+    map.insert(
+        cache_key(provider, base_url),
+        CachedModels { ts: now_secs(), models: models.to_vec() },
+    );
+    write_cache(&map);
+}
+
+// Anthropic does not publish per-model context windows in /v1/models, so we
+// keep a hardcoded mapping for the families we care about and fall back to
+// 200k for anything unrecognised.
+// HARDCODED: Anthropic /v1/models lacks capability fields.
+fn anthropic_caps_for_id(id: &str) -> ProviderCapabilities {
+    let lower = id.to_ascii_lowercase();
+    let (ctx, max_out) = if lower.contains("opus") {
+        (200_000, 32_000)
+    } else if lower.contains("haiku") {
+        (200_000, 8_192)
+    } else if lower.contains("sonnet") {
+        (200_000, 64_000)
+    } else {
+        (200_000, 8_192)
+    };
+    ProviderCapabilities {
+        context_window: ctx,
+        max_output: max_out,
+        tokenizer_kind: "claude".into(),
+        supports_caching: true,
+        supports_tools: true,
+        supports_vision: true,
+    }
+}
+
+fn anthropic_list(api_key: &str, base_url: Option<&str>) -> Result<Vec<ProviderModel>, String> {
+    let base = base_url
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    let url = format!("{base}/v1/models");
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(ANTHROPIC_TIMEOUT_SECS))
+        .build();
+    let resp = agent
+        .get(&url)
+        .set("x-api-key", api_key)
+        .set("anthropic-version", "2023-06-01")
+        .set("Accept", "application/json")
+        .call();
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(format!("{code}: {}", body.chars().take(200).collect::<String>()));
+        }
+        Err(e) => return Err(format!("Network: {e}")),
+    };
+
+    let v: serde_json::Value = resp.into_json().map_err(|e| format!("Parse: {e}"))?;
+    let arr = v.get("data").and_then(|d| d.as_array()).ok_or("missing data array")?;
+    let mut out = Vec::new();
+    for m in arr {
+        let id = match m.get("id").and_then(|s| s.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let display = m
+            .get("display_name")
+            .and_then(|s| s.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        out.push(ProviderModel {
+            id: id.clone(),
+            display_name: display,
+            capabilities: anthropic_caps_for_id(&id),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
+}
+
+fn copilot_caps_default() -> ProviderCapabilities {
+    ProviderCapabilities {
+        context_window: 128_000,
+        max_output: 16_384,
+        tokenizer_kind: "tiktoken_o200k".into(),
+        supports_caching: false,
+        supports_tools: true,
+        supports_vision: true,
+    }
+}
+
+fn copilot_list() -> Result<Vec<ProviderModel>, String> {
+    // Reuse the existing copilot.rs OAuth flow + /models endpoint.
+    let raw = crate::copilot::list_models()?;
+    let mut out = Vec::with_capacity(raw.len());
+    for m in raw {
+        let display = if m.vendor.is_empty() {
+            m.name.clone()
+        } else {
+            format!("{} ({})", m.name, m.vendor)
+        };
+        out.push(ProviderModel {
+            id: m.id,
+            display_name: display,
+            capabilities: copilot_caps_default(),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn test_anthropic(
+    api_key: String,
+    base_url: Option<String>,
+) -> Result<ProviderTestResult, String> {
+    if api_key.trim().is_empty() {
+        return Ok(ProviderTestResult { ok: false, error: Some("API key empty".into()), models: vec![] });
+    }
+    match anthropic_list(&api_key, base_url.as_deref()) {
+        Ok(models) => {
+            cache_put("anthropic", base_url.as_deref(), &models);
+            Ok(ProviderTestResult { ok: true, error: None, models })
+        }
+        Err(e) => Ok(ProviderTestResult { ok: false, error: Some(e), models: vec![] }),
+    }
+}
+
+#[tauri::command]
+pub fn test_openai(
+    api_key: String,
+    base_url: Option<String>,
+) -> Result<ProviderTestResult, String> {
+    if api_key.trim().is_empty() {
+        return Ok(ProviderTestResult { ok: false, error: Some("API key empty".into()), models: vec![] });
+    }
+    match crate::openai::list_models(&api_key, base_url.as_deref()) {
+        Ok(models) => {
+            cache_put("openai", base_url.as_deref(), &models);
+            Ok(ProviderTestResult { ok: true, error: None, models })
+        }
+        Err(e) => Ok(ProviderTestResult { ok: false, error: Some(e), models: vec![] }),
+    }
+}
+
+#[tauri::command]
+pub fn test_gemini(api_key: String) -> Result<ProviderTestResult, String> {
+    if api_key.trim().is_empty() {
+        return Ok(ProviderTestResult { ok: false, error: Some("API key empty".into()), models: vec![] });
+    }
+    match crate::gemini::list_models(&api_key) {
+        Ok(models) => {
+            cache_put("gemini", None, &models);
+            Ok(ProviderTestResult { ok: true, error: None, models })
+        }
+        Err(e) => Ok(ProviderTestResult { ok: false, error: Some(e), models: vec![] }),
+    }
+}
+
+#[tauri::command]
+pub fn test_copilot() -> Result<ProviderTestResult, String> {
+    if !crate::copilot::is_signed_in() {
+        return Ok(ProviderTestResult {
+            ok: false,
+            error: Some("Not signed in to Copilot".into()),
+            models: vec![],
+        });
+    }
+    match copilot_list() {
+        Ok(models) => {
+            cache_put("copilot", None, &models);
+            Ok(ProviderTestResult { ok: true, error: None, models })
+        }
+        Err(e) => Ok(ProviderTestResult { ok: false, error: Some(e), models: vec![] }),
+    }
+}
+
+#[tauri::command]
+pub fn test_openai_compat(
+    api_key: String,
+    base_url: String,
+) -> Result<ProviderTestResult, String> {
+    if base_url.trim().is_empty() {
+        return Ok(ProviderTestResult {
+            ok: false,
+            error: Some("Base URL empty".into()),
+            models: vec![],
+        });
+    }
+    match crate::openai_compat::list_models(&api_key, &base_url) {
+        Ok(models) => {
+            cache_put("openai_compat", Some(&base_url), &models);
+            Ok(ProviderTestResult { ok: true, error: None, models })
+        }
+        Err(e) => Ok(ProviderTestResult { ok: false, error: Some(e), models: vec![] }),
+    }
+}
+
+/// Cache-first model fetch. Hits the network only when the cache is missing
+/// or older than 24 h, so opening AI settings is instant in the common case.
+#[tauri::command]
+pub fn list_provider_models(
+    provider: String,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> Result<Vec<ProviderModel>, String> {
+    if let Some(cached) = cache_get(&provider, base_url.as_deref()) {
+        return Ok(cached);
+    }
+    match provider.as_str() {
+        "anthropic" => {
+            let key = api_key.ok_or("anthropic requires api_key")?;
+            anthropic_list(&key, base_url.as_deref()).inspect(|m| cache_put("anthropic", base_url.as_deref(), m))
+        }
+        "openai" => {
+            let key = api_key.ok_or("openai requires api_key")?;
+            crate::openai::list_models(&key, base_url.as_deref())
+                .inspect(|m| cache_put("openai", base_url.as_deref(), m))
+        }
+        "gemini" => {
+            let key = api_key.ok_or("gemini requires api_key")?;
+            crate::gemini::list_models(&key).inspect(|m| cache_put("gemini", None, m))
+        }
+        "copilot" => copilot_list().inspect(|m| cache_put("copilot", None, m)),
+        "openai_compat" => {
+            let url = base_url.ok_or("openai_compat requires base_url")?;
+            crate::openai_compat::list_models(api_key.as_deref().unwrap_or(""), &url)
+                .inspect(|m| cache_put("openai_compat", Some(&url), m))
+        }
+        other => Err(format!("unknown provider: {other}")),
+    }
 }

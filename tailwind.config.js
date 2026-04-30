@@ -5,18 +5,11 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: [
-          "Inter",
-          "system-ui",
-          "-apple-system",
-          "sans-serif",
-        ],
-        mono: [
-          "JetBrains Mono",
-          "Cascadia Code",
-          "Menlo",
-          "monospace",
-        ],
+        // Defer to the CSS vars App.tsx writes from settings on boot.
+        // Without this, tailwind preflight pinned `body` to a hardcoded
+        // Inter stack and beat the user's body_font / interface_font.
+        sans: ["var(--font-interface)", "system-ui", "sans-serif"],
+        mono: ["var(--font-monospace)", "Menlo", "monospace"],
       },
       colors: {
         panel: {

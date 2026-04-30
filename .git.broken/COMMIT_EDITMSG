@@ -1,0 +1,28 @@
+phase 4: native polish + lite build + windows/mac CI
+
+Native feel:
+- custom title bar with drag region + traffic-light buttons
+- themed React context menu (Tauri native menus look bad on GTK)
+- streaming token batcher (RAF-batched, drops per-token reflow)
+- typing-lag fix (ref-based content, no per-keystroke setTabs clone)
+- spellcheck/autocorrect off on the editor
+- WebKitGTK env vars + chat scroll containment
+
+Lite build (default):
+- llama-cpp-2 is now optional behind `local-llm` Cargo feature
+- default deb drops 397 MB → 15 MB
+- new `runtime_capabilities` IPC; AISettingsModal hides Local GGUF tab
+  in lite builds. Users run local LLMs via Ollama (openai_compat).
+
+Distribution:
+- icon design (warm-amber F mark) + tauri icon generation
+- bundle metadata (category, descriptions, debian section)
+- new GitHub Actions release workflow: tri-platform matrix
+  (Linux deb/AppImage, Windows msi/nsis, macOS dmg arm64+x86_64),
+  workflow_dispatch + tag-triggered
+
+Wikilinks:
+- StateEffect-driven decoration rebuild on tree-load
+  (fixes [shortRef] not being clickable until manual read/write toggle)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

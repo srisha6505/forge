@@ -29,6 +29,41 @@ pub enum AgentEvent {
     Error(String),
 }
 
+// ── Helpers ──
+
+/// Pull a filename hint out of a user message. Matches the first token
+/// that looks like a markdown path (`<word>.md` or `<dir>/<word>.md`).
+/// Returns None if no plausible filename is mentioned. Conservative on
+/// purpose: false positives create wrong filenames, false negatives just
+/// fall through to heading-derivation.
+fn extract_filename_hint(text: &str) -> Option<String> {
+    // Token = run of [A-Za-z0-9_./-] ending in `.md`. Avoid words like
+    // "test.md," by trimming trailing punctuation. We do this by hand
+    // rather than pulling regex into the dep tree.
+    for raw in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`') {
+        let token = raw.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'));
+        if !token.ends_with(".md") {
+            continue;
+        }
+        if token.len() < 4 {
+            continue;
+        }
+        // Reject anything that starts with `.` (hidden files) or `/`
+        // (absolute paths) — vault paths are always relative.
+        if token.starts_with('.') || token.starts_with('/') {
+            continue;
+        }
+        let valid = token.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'
+        });
+        if !valid {
+            continue;
+        }
+        return Some(token.to_string());
+    }
+    None
+}
+
 // ── Tool context ──
 
 pub struct ToolContext {
@@ -43,6 +78,17 @@ pub struct ToolContext {
     pub search_index_path: PathBuf,
     /// Path to the on-disk SQLite chunks DB (paired with `search_index_path`).
     pub search_db_path: PathBuf,
+    /// Filename hint extracted from the most recent user message (e.g.
+    /// "grav.md" when the user said "make grav.md"). Used by write_file
+    /// when the model drops the `path` arg. Set by the agent loop once
+    /// per turn before dispatching tools.
+    pub user_filename_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Last successful write_file path within this session. Used as the
+    /// default path when the model retries write_file without a path —
+    /// small models (Gemma 4 E4B) iteratively rewrite content and drop
+    /// the path each time; reusing the prior path means iterative drafts
+    /// land in one file instead of spawning N new files per retry.
+    pub last_write_path: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 // ── Tool result ──
@@ -610,75 +656,74 @@ fn exec_read_section(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
 
 // ── New tool implementations ──
 
+/// Clean up content emitted by small models that mis-escape on the way
+/// through JSON serialisation. Two distinct cases that both showed up
+/// repeatedly with Gemma 4 E4B:
+///
+/// 1. The model wraps the whole content in an extra pair of `"` chars
+///    (treats the content slot as needing its own JSON encoding). After
+///    parsing, the file starts with a literal `"` and ends with one.
+///    Strip when BOTH ends are `"` — markdown content essentially never
+///    starts and ends with a quote at the same time.
+///
+/// 2. Single backslashes that should be double: `\frac` → JSON parser
+///    eats the `\f` as the form-feed control character (U+000C). The
+///    rendered note shows `Gfrac{...}` because the invisible char gets
+///    dropped on display. Same trap with `\b` (U+0008), `\v` (U+000B),
+///    `\t` (U+0009 — kept; tabs are legitimate). We replace these
+///    control chars with their LaTeX-style backslash-letter form so the
+///    common math-mode escapes survive.
+fn sanitize_model_content(raw: &str) -> String {
+    let mut s = raw.to_string();
+    // Strip outer-quote wrapping if present on both ends.
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner: String = s[1..s.len() - 1].to_string();
+        // Only strip if the inner doesn't itself start with `"` — avoids
+        // mangling content that genuinely begins with a quoted string.
+        if !inner.starts_with('"') {
+            s = inner;
+        }
+    }
+    // Recover backslash-letter LaTeX escapes that JSON tokenized as control chars.
+    s = s
+        .replace('\u{0008}', "\\b")
+        .replace('\u{000B}', "\\v")
+        .replace('\u{000C}', "\\f")
+        // Bell isn't standard LaTeX but it's the same model bug for `\a`.
+        .replace('\u{0007}', "\\a");
+    s
+}
+
 fn exec_write_file(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
-    // Primary: named fields for path.
+    // The contract is simple: model gives us `content` and `path`, we write
+    // the bytes to disk. No sanitization, no escape decoding, no path
+    // guessing, no content rescue. If the model gives bad args, we fail
+    // and let the model see the error and retry — that's how an agent
+    // loop is supposed to work.
     let mut rel_path = tc.arguments.get("path")
-        .or_else(|| tc.arguments.get("file"))
-        .or_else(|| tc.arguments.get("filename"))
-        .or_else(|| tc.arguments.get("filepath"))
-        .or_else(|| tc.arguments.get("file_path"))
-        .or_else(|| tc.arguments.get("name"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    // Primary: named fields for content.
-    let mut content = tc.arguments.get("content")
-        .or_else(|| tc.arguments.get("text"))
-        .or_else(|| tc.arguments.get("body"))
-        .or_else(|| tc.arguments.get("data"))
-        .or_else(|| tc.arguments.get("file_content"))
+    let content = tc.arguments.get("content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    // Fallback: if path is still missing, scan the arguments object for any
-    // string value that looks like a filename (contains '.' and no newlines,
-    // reasonable length). This rescues malformed tool calls where the model
-    // put the filename under an unexpected key.
+    // The only fallback we keep: if the model omits `path` but the user's
+    // message explicitly named a file (e.g., "create foo.md"), use that.
+    // Gemma 4 E4B sometimes drops the path field on long write_file calls
+    // and the user's intent is unambiguous in that case. No other path
+    // fallbacks — slug derivation, timestamp, last-write reuse all gone.
     if rel_path.is_empty() {
-        if let Some(obj) = tc.arguments.as_object() {
-            for (k, v) in obj {
-                if k == "content" || k == "text" || k == "body" || k == "data" {
-                    continue;
-                }
-                if let Some(s) = v.as_str() {
-                    let looks_like_file = s.len() < 200
-                        && !s.contains('\n')
-                        && s.contains('.')
-                        && !s.contains(' ');
-                    if looks_like_file {
-                        eprintln!("[forge-agent] write_file rescued path from field '{}' = {:?}", k, s);
-                        rel_path = s.to_string();
-                        break;
-                    }
-                }
-            }
+        if let Some(hint) = ctx.user_filename_hint.lock().ok().and_then(|g| g.clone()) {
+            eprintln!("[forge-agent] write_file using user filename hint: {:?}", hint);
+            rel_path = hint;
         }
     }
-
-    // Fallback: if content is still empty, use any remaining string value
-    // that is not the path.
-    if content.is_empty() {
-        if let Some(obj) = tc.arguments.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    if s != rel_path && k != "path" && k != "file" && k != "filename" && k != "filepath" && k != "file_path" && k != "name" {
-                        content = s.to_string();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     if rel_path.is_empty() {
-        eprintln!("[forge-agent] write_file FAILED to find path. Raw args: {}", tc.arguments);
         return ToolResult {
-            content: format!(
-                "write_file could not find a path in the arguments. You must provide path as a plain string, e.g. path:\"notes/test.md\". Received: {}",
-                tc.arguments
-            ),
+            content: "write_file requires a non-empty `path` argument.".to_string(),
             is_error: true,
         };
     }
@@ -721,6 +766,11 @@ fn exec_write_file(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
                     let _ = vs.index_file(&full_path);
                     let _ = vs.save_index(&ctx.search_index_path);
                 }
+            }
+            // Remember this path so a follow-up write_file with a missing
+            // path lands here instead of spawning a new file.
+            if let Ok(mut g) = ctx.last_write_path.lock() {
+                *g = Some(rel_path.clone());
             }
             ToolResult {
                 content: format!("Successfully wrote {} bytes to {}", content.len(), rel_path),
@@ -1208,9 +1258,52 @@ pub fn default_system_prompt(vault_name: &str) -> String {
          6. After tool results, USE the results. Do not ignore them and hallucinate.\n\
          \n\
          RESPONSE RULES:\n\
-         - Report what the tool actually returned. If list_files returned files A, B, C — say A, B, C.\n\
+         - Report what the tool actually returned. If list_files returned files A, B, C, say A, B, C.\n\
          - Cite actual file paths, not invented ones.\n\
-         - Be concise. Synthesize, don't dump raw results."
+         - Be concise. Synthesize, don't dump raw results.\n\
+         - NO emojis anywhere (headings, body, widgets).\n\
+         - NO em-dashes (use a comma, period, or colon instead).\n\
+         \n\
+         INTERACTIVE WIDGETS (mandatory format — read carefully):\n\
+         The ONLY way to render an interactive widget is a triple-backtick FENCED CODE BLOCK with info string `js-widget`. Inside that fence, put EVERYTHING the widget needs — sliders, canvases, divs, scripts. Sliders outside the fence cannot communicate with scripts inside it (the widget runs in an iframe, sliders in markdown live in the parent DOM).\n\
+         \n\
+         RIGHT (do this):\n\
+         ```js-widget height=320\n\
+         <canvas id=\"c\" style=\"width:100%;height:200px\"></canvas>\n\
+         <input id=\"f\" type=\"range\" min=\"0.1\" max=\"5\" value=\"1\">\n\
+         <script>const c=document.getElementById('c'); const f=document.getElementById('f'); /* ... */</script>\n\
+         ```\n\
+         \n\
+         WRONG (none of these work — the renderer ignores them):\n\
+         - Bare <canvas>/<script> in the markdown body without a fence\n\
+         - Slider <input> placed BEFORE/OUTSIDE the fence (script can't see it)\n\
+         - Using ```html or no info string instead of ```js-widget\n\
+         \n\
+         The info string `js-widget` is intentionally not `html`, don't shorten or substitute. If you put any widget code outside a js-widget fence, NOTHING runs and the user sees raw HTML source text.\n\
+         \n\
+         WIDGET STYLING (mandatory, both themes must work):\n\
+         - Use ONLY theme CSS variables for colors. Available inside the iframe:\n\
+             var(--color-bg)              page background\n\
+             var(--color-bg-alt)          canvas background, cards\n\
+             var(--color-text)            primary text and lines\n\
+             var(--color-text-secondary)  axes, grid, ticks, secondary text\n\
+             var(--color-accent)          ONE highlight color (the data line, the active marker)\n\
+             var(--color-success)         optional second series\n\
+             var(--color-error)           optional warning/loss color\n\
+             var(--color-border)          borders, separators\n\
+         - In canvas drawing, read these via getComputedStyle:\n\
+             const css = getComputedStyle(document.documentElement);\n\
+             const accent = css.getPropertyValue('--color-accent').trim();\n\
+         - NEVER hardcode hex colors (no '#fff', no 'black', no 'rgb(...)' literals).\n\
+         - NEVER produce rainbow series with hsl(i/N*360, ...). Use accent for the primary curve, secondary for everything else. Color is signal, not decoration.\n\
+         \n\
+         WIDGET SCALES (mandatory for any plot):\n\
+         - Draw axis lines (left edge and bottom edge) in var(--color-text-secondary).\n\
+         - Draw 4-5 tick labels on each axis with their numeric values.\n\
+         - Draw a faint grid in var(--color-border) at the tick positions.\n\
+         - Label the axes (xLabel, yLabel) so the viewer knows what the axes represent.\n\
+         - Reserve ~40px on the left and ~30px at the bottom for labels and ticks.\n\
+         - A naked curve on a colored canvas with no scale is unacceptable."
     )
 }
 
@@ -1231,6 +1324,36 @@ pub fn run_agent_loop(
     let mut last_call_sig: Option<String> = None;
     let mut consecutive_failures = 0usize;
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Pull a filename hint out of the user's most recent message: any
+    // bareword ending in `.md` (e.g. "make grav.md", "save it as
+    // research/x.md"). This is the highest-priority fallback for
+    // path-less write_file calls — covers the case where the model drops
+    // the path arg but the user did say what to call the file.
+    {
+        let mut hint: Option<String> = None;
+        for m in messages.iter().rev() {
+            if !matches!(m.role, crate::llm::ChatRole::User) {
+                continue;
+            }
+            let re_hint = extract_filename_hint(&m.content);
+            if re_hint.is_some() {
+                hint = re_hint;
+                break;
+            }
+        }
+        if let Some(h) = &hint {
+            eprintln!("[forge-agent] user filename hint extracted: {:?}", h);
+        }
+        if let Ok(mut g) = ctx.user_filename_hint.lock() {
+            *g = hint;
+        }
+        // Reset last_write_path each turn so a stale path from a
+        // previous user turn doesn't leak into a fresh request.
+        if let Ok(mut g) = ctx.last_write_path.lock() {
+            *g = None;
+        }
+    }
 
     loop {
         if iterations >= max_iterations {
@@ -1265,8 +1388,17 @@ pub fn run_agent_loop(
                     let call_sig = format!("{}::{}", tc.name, args_str);
 
                     // Dedup: if same name+args already called, feed error back
-                    // to the model so it generates different output (not skip silently).
-                    if seen_calls.contains(&call_sig) {
+                    // to the model so it generates different output. Only
+                    // applies to read-style tools — write/edit operations
+                    // are idempotent (they overwrite) and small models like
+                    // Gemma 4 E4B legitimately retry a write_file when the
+                    // first call's content was truncated by streaming. We
+                    // must NOT block those retries.
+                    let is_idempotent_write = matches!(
+                        tc.name.as_str(),
+                        "write_file" | "edit_file" | "create_note" | "rename_file"
+                    );
+                    if !is_idempotent_write && seen_calls.contains(&call_sig) {
                         let _ = event_tx.send(AgentEvent::ToolCallResult {
                             name: tc.name.clone(),
                             content: "Already called with same arguments. Use a different query or proceed to synthesize an answer.".into(),

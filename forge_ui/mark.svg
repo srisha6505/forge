@@ -1,0 +1,9 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Mission Forge mark">
+  <rect width="64" height="64" rx="12" fill="#F5EFE4"></rect>
+  <g transform="translate(10, 12)">
+    <path d="M 4 30 L 40 30 L 32 42 L 12 42 Z" fill="none" stroke="#2A2118" stroke-width="2.4" stroke-linejoin="round"></path>
+    <path d="M 12 18 L 32 18 L 28 30 L 16 30 Z" fill="none" stroke="#2A2118" stroke-width="2.4" stroke-linejoin="round"></path>
+    <path d="M 22 6 L 22 14 M 18 10 L 26 10" stroke="#D98A2B" stroke-width="2.4" stroke-linecap="round"></path>
+  </g>
+</svg>

@@ -1,0 +1,239 @@
+/* Forge — tokens per design.md §2 */
+
+:root, .theme-light {
+  /* Surfaces */
+  --background-primary:        hsl(40, 0%, 100%);
+  --background-primary-alt:    hsl(40, 25%, 97%);
+  --background-secondary:      hsl(40, 22%, 96%);
+  --background-secondary-alt:  hsl(40, 20%, 92%);
+
+  /* Modifiers */
+  --background-modifier-border:         hsl(40, 15%, 89%);
+  --background-modifier-border-hover:   hsl(40, 15%, 80%);
+  --background-modifier-border-focus:   hsl(38, 45%, 55%);
+  --background-modifier-hover:          hsl(40, 25%, 94%);
+  --background-modifier-active:         hsl(40, 45%, 88%);
+  --background-modifier-active-hover:   hsl(40, 45%, 82%);
+  --background-modifier-form-field:     hsl(0, 0%, 100%);
+  --background-modifier-form-field-highlighted: hsl(40, 25%, 98%);
+  --background-modifier-box-shadow:     hsla(40, 20%, 10%, 0.08);
+  --background-modifier-error:          hsla(8, 70%, 55%, 0.1);
+  --background-modifier-error-hover:    hsla(8, 70%, 55%, 0.18);
+  --background-modifier-success:        hsla(92, 40%, 45%, 0.1);
+  --background-modifier-message:        hsla(40, 20%, 10%, 0.04);
+  --background-modifier-info:           hsla(210, 68%, 50%, 0.1);
+
+  /* Text */
+  --text-normal:        hsl(32, 10%, 12%);
+  --text-muted:         hsl(32, 7%, 38%);
+  --text-faint:         hsl(32, 6%, 58%);
+  --text-bold:          hsl(32, 10%, 8%);
+  --text-accent:        hsl(34, 72%, 40%);
+  --text-accent-hover:  hsl(34, 72%, 32%);
+  --text-on-accent:     hsl(0, 0%, 100%);
+  --text-error:         hsl(8, 68%, 48%);
+  --text-success:       hsl(92, 42%, 38%);
+  --text-warning:       hsl(34, 72%, 45%);
+  --text-info:          hsl(210, 68%, 42%);
+
+  --text-title-h1: hsl(32, 10%, 10%);
+  --text-title-h2: hsl(32, 10%, 10%);
+  --text-title-h3: hsl(32, 10%, 12%);
+  --text-title-h4: hsl(32, 10%, 15%);
+
+  --text-link:          hsl(34, 72%, 40%);
+  --text-highlight-bg:  hsla(38, 85%, 60%, 0.35);
+  --text-selection:     hsla(34, 70%, 50%, 0.22);
+
+  /* Interactive */
+  --interactive-normal:        hsl(40, 22%, 94%);
+  --interactive-hover:         hsl(40, 22%, 89%);
+  --interactive-accent:        hsl(34, 72%, 40%);
+  --interactive-accent-hover:  hsl(34, 72%, 34%);
+
+  /* Code */
+  --code-normal:     hsl(34, 72%, 35%);
+  --code-background: hsl(40, 22%, 96%);
+  --code-comment:    hsl(32, 6%, 58%);
+  --code-string:     hsl(92, 42%, 38%);
+  --code-keyword:    hsl(280, 60%, 45%);
+  --code-function:   hsl(210, 68%, 42%);
+  --code-number:     hsl(34, 72%, 35%);
+
+  /* Chrome */
+  --hr-color:        hsl(40, 15%, 89%);
+  --caret-color:     hsl(34, 72%, 40%);
+  --scrollbar-thumb-bg:       hsla(32, 8%, 40%, 0.25);
+  --scrollbar-active-thumb-bg: hsla(32, 8%, 40%, 0.45);
+  --icon-color:       hsl(32, 7%, 42%);
+  --icon-color-hover: hsl(32, 10%, 12%);
+  --icon-color-active: hsl(34, 72%, 40%);
+
+  /* Shadows */
+  --shadow-s: 0 1px 2px hsla(32, 15%, 10%, 0.04);
+  --shadow-m: 0 2px 8px hsla(32, 15%, 10%, 0.06), 0 1px 2px hsla(32, 15%, 10%, 0.04);
+  --shadow-l: 0 8px 24px hsla(32, 15%, 10%, 0.12), 0 2px 6px hsla(32, 15%, 10%, 0.06);
+
+  --focus-ring:        hsla(34, 72%, 45%, 0.55);
+  --graph-node-default:  hsl(32, 20%, 65%);
+  --graph-node-promoted: hsl(34, 62%, 55%);
+  --graph-edge:          hsla(32, 8%, 50%, 0.3);
+
+  --modal-backdrop: hsla(35, 12%, 6%, 0.6);
+}
+
+.theme-dark {
+  --background-primary:        hsl(35, 10%, 12%);
+  --background-primary-alt:    hsl(35, 10%, 10%);
+  --background-secondary:      hsl(35, 11%, 8%);
+  --background-secondary-alt:  hsl(35, 12%, 6%);
+
+  --background-modifier-border:         hsl(35, 8%, 18%);
+  --background-modifier-border-hover:   hsl(35, 8%, 26%);
+  --background-modifier-border-focus:   hsl(38, 55%, 55%);
+  --background-modifier-hover:          hsl(35, 10%, 15%);
+  --background-modifier-active:         hsl(35, 14%, 19%);
+  --background-modifier-active-hover:   hsl(35, 14%, 24%);
+  --background-modifier-form-field:     hsl(35, 11%, 8%);
+  --background-modifier-form-field-highlighted: hsl(35, 10%, 10%);
+  --background-modifier-box-shadow:     hsla(0, 0%, 0%, 0.45);
+  --background-modifier-error:          hsla(12, 70%, 60%, 0.12);
+  --background-modifier-error-hover:    hsla(12, 70%, 60%, 0.2);
+  --background-modifier-success:        hsla(92, 35%, 55%, 0.12);
+  --background-modifier-message:        hsla(0, 0%, 100%, 0.04);
+  --background-modifier-info:           hsla(205, 60%, 66%, 0.12);
+
+  --text-normal:        hsl(40, 25%, 82%);
+  --text-muted:         hsl(38, 18%, 62%);
+  --text-faint:         hsl(38, 12%, 42%);
+  --text-bold:          hsl(42, 35%, 90%);
+  --text-accent:        hsl(38, 62%, 62%);
+  --text-accent-hover:  hsl(38, 70%, 72%);
+  --text-on-accent:     hsl(35, 10%, 10%);
+  --text-error:         hsl(12, 68%, 62%);
+  --text-success:       hsl(92, 38%, 60%);
+  --text-warning:       hsl(38, 62%, 62%);
+  --text-info:          hsl(205, 60%, 66%);
+
+  --text-title-h1: hsl(42, 35%, 90%);
+  --text-title-h2: hsl(42, 35%, 88%);
+  --text-title-h3: hsl(42, 30%, 84%);
+  --text-title-h4: hsl(42, 25%, 80%);
+
+  --text-link:          hsl(38, 62%, 62%);
+  --text-highlight-bg:  hsla(38, 85%, 62%, 0.25);
+  --text-selection:     hsla(38, 62%, 60%, 0.22);
+
+  --interactive-normal:        hsl(35, 10%, 15%);
+  --interactive-hover:         hsl(35, 12%, 20%);
+  --interactive-accent:        hsl(38, 62%, 62%);
+  --interactive-accent-hover:  hsl(38, 72%, 72%);
+
+  --code-normal:     hsl(38, 62%, 62%);
+  --code-background: hsl(35, 11%, 9%);
+  --code-comment:    hsl(38, 12%, 45%);
+  --code-string:     hsl(92, 38%, 60%);
+  --code-keyword:    hsl(290, 50%, 70%);
+  --code-function:   hsl(205, 60%, 66%);
+  --code-number:     hsl(38, 62%, 62%);
+
+  --hr-color:        hsl(35, 8%, 18%);
+  --caret-color:     hsl(38, 62%, 62%);
+  --scrollbar-thumb-bg:       hsla(40, 20%, 70%, 0.18);
+  --scrollbar-active-thumb-bg: hsla(40, 25%, 75%, 0.32);
+  --icon-color:       hsl(38, 18%, 62%);
+  --icon-color-hover: hsl(40, 30%, 85%);
+  --icon-color-active: hsl(38, 62%, 62%);
+
+  --shadow-s: 0 1px 2px hsla(0, 0%, 0%, 0.3);
+  --shadow-m: 0 4px 12px hsla(0, 0%, 0%, 0.35), 0 1px 3px hsla(0, 0%, 0%, 0.2);
+  --shadow-l: 0 16px 40px hsla(0, 0%, 0%, 0.45), 0 4px 10px hsla(0, 0%, 0%, 0.25);
+
+  --focus-ring:        hsla(38, 62%, 62%, 0.55);
+  --graph-node-default:  hsl(38, 18%, 55%);
+  --graph-node-promoted: hsl(38, 55%, 65%);
+  --graph-edge:          hsla(40, 20%, 70%, 0.2);
+
+  --modal-backdrop: hsla(0, 0%, 0%, 0.7);
+}
+
+:root {
+  /* Typography */
+  --font-interface: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-text: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-monospace: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --font-serif: "Newsreader", ui-serif, Georgia, serif;
+
+  --font-ui-smaller: 11px;
+  --font-ui-small:   12px;
+  --font-ui-medium:  13px;
+  --font-ui-large:   15px;
+  --font-ui-larger:  17px;
+
+  --line-height-tight:   1.2;
+  --line-height-snug:    1.35;
+  --line-height-normal:  1.55;
+  --line-height-relaxed: 1.7;
+
+  /* Spacing */
+  --size-2-1: 2px; --size-2-2: 4px; --size-2-3: 6px;
+  --size-4-1: 4px; --size-4-2: 8px; --size-4-3: 12px;
+  --size-4-4: 16px; --size-4-5: 20px; --size-4-6: 24px; --size-4-8: 32px;
+
+  /* Radii */
+  --radius-s: 4px; --radius-m: 6px; --radius-l: 8px; --radius-xl: 12px;
+
+  /* Layout */
+  --topbar-height: 36px;
+  --tab-height: 40px;
+  --statusbar-height: 26px;
+  --ribbon-width: 48px;
+  --sidebar-width: 260px;
+  --chat-width: 420px;
+
+  /* Motion */
+  --motion-duration-fast: 120ms;
+  --motion-duration-base: 180ms;
+  --motion-duration-slow: 260ms;
+  --motion-ease:        cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* z-index */
+  --z-editor: 0; --z-sidebar: 10; --z-header: 20;
+  --z-dropdown: 100; --z-popover: 200;
+  --z-modal-backdrop: 900; --z-modal: 1000;
+  --z-toast: 1100; --z-tooltip: 1200;
+}
+
+/* Base */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body {
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+  background: var(--background-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+::selection { background: var(--text-selection); }
+
+/* Scrollbars */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb-bg); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-active-thumb-bg); background-clip: padding-box; border: 2px solid transparent; }
+
+button { font-family: inherit; }
+input, textarea, select { font-family: inherit; }
+a { color: var(--text-link); text-decoration: none; }
+a:hover { color: var(--text-accent-hover); text-decoration: underline; text-underline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 1ms !important; animation-duration: 1ms !important; }
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
