@@ -104,6 +104,34 @@ pub struct ToolResult {
 
 // ── Path validation helper ──
 
+/// Strip the Windows UNC prefix `\\?\` so that `Path::starts_with` works
+/// against a non-prefixed vault root. `std::fs::canonicalize` on Windows
+/// returns extended-length paths (e.g. `\\?\C:\Users\code\vault`) while
+/// the rest of the codebase keeps `vault_path` un-prefixed, so the
+/// bounds check `canonical.starts_with(vault_root)` was rejecting every
+/// list_files / read_file the agent attempted on Windows. No-op on
+/// Linux/Mac.
+#[cfg(target_os = "windows")]
+fn strip_unc(p: PathBuf) -> PathBuf {
+    if let Some(s) = p.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+#[cfg(not(target_os = "windows"))]
+fn strip_unc(p: PathBuf) -> PathBuf { p }
+
+/// Canonicalize both sides of a vault-bounds check before comparing.
+/// Returns true if `candidate` resolves to a path inside (or equal to)
+/// `vault_root`. False on any canonicalize failure or out-of-bounds.
+fn is_within_vault(candidate: &Path, vault_root: &Path) -> bool {
+    let Ok(c) = candidate.canonicalize() else { return false; };
+    let v = vault_root.canonicalize().unwrap_or_else(|_| vault_root.to_path_buf());
+    strip_unc(c).starts_with(strip_unc(v))
+}
+
 /// Validate that a path resolves within the vault root. For existing paths uses
 /// canonicalize(); for new paths (write_file, rename target) canonicalizes the
 /// parent directory and appends the file name.
@@ -117,13 +145,13 @@ fn validate_vault_path(vault_root: &Path, rel_path: &str, must_exist: bool) -> R
     if must_exist {
         match full_path.canonicalize() {
             Ok(canonical) => {
-                if !canonical.starts_with(vault_root) {
+                if !is_within_vault(&full_path, vault_root) {
                     return Err(ToolResult {
                         content: "Path is outside the vault".into(),
                         is_error: true,
                     });
                 }
-                Ok(canonical)
+                Ok(strip_unc(canonical))
             }
             Err(_) => Err(ToolResult {
                 content: format!("File not found: {rel_path}"),
@@ -133,11 +161,17 @@ fn validate_vault_path(vault_root: &Path, rel_path: &str, must_exist: bool) -> R
     } else {
         // For paths that may not exist yet, canonicalize the parent.
         let parent = full_path.parent().unwrap_or(vault_root);
-        // Ensure parent exists (or at least the vault root prefix resolves).
-        let canonical_parent = if parent.exists() {
-            parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+        if parent.exists() {
+            if !is_within_vault(parent, vault_root) {
+                return Err(ToolResult {
+                    content: "Path is outside the vault".into(),
+                    is_error: true,
+                });
+            }
         } else {
-            // Walk up to find an existing ancestor.
+            // Walk up to find an existing ancestor and check that's in
+            // the vault. Catches `../../etc/passwd`-style escapes even
+            // when the literal full_path doesn't exist.
             let mut ancestor = parent.to_path_buf();
             while !ancestor.exists() {
                 if let Some(p) = ancestor.parent() {
@@ -146,22 +180,12 @@ fn validate_vault_path(vault_root: &Path, rel_path: &str, must_exist: bool) -> R
                     break;
                 }
             }
-            let canonical_ancestor = ancestor.canonicalize().unwrap_or(ancestor);
-            if !canonical_ancestor.starts_with(vault_root) {
+            if !is_within_vault(&ancestor, vault_root) {
                 return Err(ToolResult {
                     content: "Path is outside the vault".into(),
                     is_error: true,
                 });
             }
-            // Reconstruct by replacing the resolved ancestor portion.
-            canonical_ancestor
-        };
-
-        if !canonical_parent.starts_with(vault_root) {
-            return Err(ToolResult {
-                content: "Path is outside the vault".into(),
-                is_error: true,
-            });
         }
 
         Ok(full_path)
@@ -554,14 +578,15 @@ fn exec_list_files(tc: &ToolCall, ctx: &ToolContext) -> ToolResult {
         ctx.vault_path.join(rel_dir)
     };
 
-    // Path traversal check.
-    if let Ok(canonical) = dir.canonicalize() {
-        if !canonical.starts_with(&ctx.vault_path) {
-            return ToolResult {
-                content: "Directory is outside the vault".into(),
-                is_error: true,
-            };
-        }
+    // Path traversal check. is_within_vault canonicalizes both sides
+    // and strips the Windows UNC prefix; without that the bare
+    // `canonical.starts_with(vault)` always failed on Windows since
+    // canonicalize returned `\\?\C:\...` and the vault didn't.
+    if !is_within_vault(&dir, &ctx.vault_path) {
+        return ToolResult {
+            content: "Directory is outside the vault".into(),
+            is_error: true,
+        };
     }
 
     if !dir.is_dir() {
