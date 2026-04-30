@@ -126,10 +126,20 @@ fn strip_unc(p: PathBuf) -> PathBuf { p }
 /// Canonicalize both sides of a vault-bounds check before comparing.
 /// Returns true if `candidate` resolves to a path inside (or equal to)
 /// `vault_root`. False on any canonicalize failure or out-of-bounds.
+/// On Windows compares case-insensitively because the FS is.
 fn is_within_vault(candidate: &Path, vault_root: &Path) -> bool {
     let Ok(c) = candidate.canonicalize() else { return false; };
     let v = vault_root.canonicalize().unwrap_or_else(|_| vault_root.to_path_buf());
-    strip_unc(c).starts_with(strip_unc(v))
+    let c = strip_unc(c);
+    let v = strip_unc(v);
+    #[cfg(target_os = "windows")]
+    {
+        let cs = c.to_string_lossy().to_lowercase();
+        let vs = v.to_string_lossy().to_lowercase();
+        return cs == vs || cs.starts_with(&format!("{vs}\\")) || cs.starts_with(&format!("{vs}/"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    c.starts_with(&v)
 }
 
 /// Validate that a path resolves within the vault root. For existing paths uses

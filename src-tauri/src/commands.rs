@@ -231,13 +231,8 @@ pub fn write_file(
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let vault_canon = vault.canonicalize().map_err(|e| e.to_string())?;
-    let parent_canon = full
-        .parent()
-        .ok_or_else(|| "Invalid path".to_string())?
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    if !parent_canon.starts_with(&vault_canon) {
+    let parent = full.parent().ok_or_else(|| "Invalid path".to_string())?;
+    if !is_within_vault(parent, &vault) {
         return Err("Path escapes vault".into());
     }
     fs::write(&full, content).map_err(|e| e.to_string())
@@ -260,13 +255,8 @@ pub fn rename_file(
     if let Some(parent) = to_pb.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let vault_canon = vault.canonicalize().map_err(|e| e.to_string())?;
-    let to_parent_canon = to_pb
-        .parent()
-        .ok_or_else(|| "Invalid target path".to_string())?
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    if !to_parent_canon.starts_with(&vault_canon) {
+    let to_parent = to_pb.parent().ok_or_else(|| "Invalid target path".to_string())?;
+    if !is_within_vault(to_parent, &vault) {
         return Err("Target path escapes vault".into());
     }
     fs::rename(&from_pb, &to_pb).map_err(|e| e.to_string())
@@ -1124,6 +1114,44 @@ pub fn open_in_text_editor(path: String) -> Result<(), String> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Strip the Windows extended-length prefix (`\\?\`) from a canonical
+/// path. `std::fs::canonicalize` on Windows always returns these UNC
+/// forms, but the rest of the code stores `vault_path` un-prefixed,
+/// so a naive `canonical.starts_with(vault_root)` always rejected
+/// every read_file / write_file / list_files. No-op on Linux/Mac.
+#[cfg(target_os = "windows")]
+fn strip_unc(p: PathBuf) -> PathBuf {
+    if let Some(s) = p.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+#[cfg(not(target_os = "windows"))]
+fn strip_unc(p: PathBuf) -> PathBuf { p }
+
+/// Check whether `candidate` resolves inside (or equal to) `vault_root`.
+/// Canonicalises both, strips the Windows UNC prefix, and on Windows
+/// compares case-insensitively (filesystem is case-preserving but not
+/// case-sensitive — `C:\Users\srisha` and `C:\users\srisha` are the
+/// same directory but byte-equal `starts_with` would reject one of
+/// them). Returns false if either path can't canonicalise.
+fn is_within_vault(candidate: &Path, vault: &Path) -> bool {
+    let Ok(c) = candidate.canonicalize() else { return false; };
+    let v = vault.canonicalize().unwrap_or_else(|_| vault.to_path_buf());
+    let c = strip_unc(c);
+    let v = strip_unc(v);
+    #[cfg(target_os = "windows")]
+    {
+        let cs = c.to_string_lossy().to_lowercase();
+        let vs = v.to_string_lossy().to_lowercase();
+        return cs == vs || cs.starts_with(&format!("{vs}\\")) || cs.starts_with(&format!("{vs}/"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    c.starts_with(&v)
+}
+
 fn resolve_within_vault(vault: &Path, path: &Path) -> Result<PathBuf, String> {
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -1133,16 +1161,14 @@ fn resolve_within_vault(vault: &Path, path: &Path) -> Result<PathBuf, String> {
     let canonical = full
         .canonicalize()
         .map_err(|e| format!("Cannot resolve {}: {e}", full.display()))?;
-    let vault_canon = vault
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve vault root: {e}"))?;
-    if !canonical.starts_with(&vault_canon) {
+    if !is_within_vault(&full, vault) {
         return Err(format!(
             "Path escapes vault: {}",
             canonical.display()
         ));
     }
-    Ok(canonical)
+    // Strip UNC so callers get a friendly path, not `\\?\C:\...`.
+    Ok(strip_unc(canonical))
 }
 
 // ── Copilot auth ──────────────────────────────────────────────────────

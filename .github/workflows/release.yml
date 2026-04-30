@@ -98,12 +98,20 @@ jobs:
       # We do NOT pass --features local-llm; lite is the default and ships
       # without the bundled llama.cpp runtime so the installer is ~15 MB
       # instead of ~400 MB. Users run local LLMs via Ollama.
+      #
+      # On tag push, tauri-action auto-creates a draft GitHub Release at
+      # ${tag}, attaches each platform's bundles, and the first matrix leg
+      # to finish creates it (subsequent legs append their artifacts).
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.tauri-args }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Forge {0}', github.ref_name) || '' }}
+          releaseDraft: false
+          prerelease: false
 
       # ── Upload bundles as workflow artifacts ─────────────────────────
       # Always upload so manual runs without a tag still get downloadable
