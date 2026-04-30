@@ -32,3 +32,9 @@ dist/
 src-old/
 Cargo.toml.old
 Cargo.lock.old
+
+# Per-machine cargo configs (GPUI-era sqlite3_stub linker hacks etc.).
+# Each developer keeps their own; never commit absolute paths or
+# host-specific link args to the repo, since CI can't satisfy them.
+.cargo/config.toml
+src-tauri/.cargo/config.toml
