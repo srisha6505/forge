@@ -38,3 +38,8 @@ Cargo.lock.old
 # host-specific link args to the repo, since CI can't satisfy them.
 .cargo/config.toml
 src-tauri/.cargo/config.toml
+
+# Personal design notes / scratch — not part of the source tree.
+# Move into docs/ if you want them shipped.
+/inference.md
+/land.md
