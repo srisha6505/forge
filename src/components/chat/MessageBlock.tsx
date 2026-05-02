@@ -1,34 +1,14 @@
-import { memo } from "react";
+import { lazy, memo, Suspense } from "react";
 import type { CSSProperties } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeHighlight from "rehype-highlight";
-import rehypeKatex from "rehype-katex";
-import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
-// Route external-protocol clicks through the OS shell so the chat panel
-// doesn't navigate the Tauri webview when a user clicks a citation or
-// reference URL. Mirrors the same handler in MarkdownPreview.tsx.
-const EXTERNAL_RE = /^(https?:|mailto:|ftp:|tel:)/i;
-const CHAT_MD_COMPONENTS = {
-  a({ href, children, ...rest }: { href?: string; children?: React.ReactNode }) {
-    return (
-      <a
-        href={href}
-        onClick={(e) => {
-          if (href && EXTERNAL_RE.test(href)) {
-            e.preventDefault();
-            void shellOpen(href).catch(() => {});
-          }
-        }}
-        {...rest}
-      >
-        {children}
-      </a>
-    );
-  },
-};
+// The full unified pipeline (react-markdown + remark-gfm + remark-math
+// + rehype-katex + rehype-highlight, ~150 KB gz combined) lives in
+// its own chunk. It only loads when a *finished* assistant turn needs
+// it — streaming messages render as plain pre-wrap text in the branch
+// below, so the chat surface boots without paying for the renderer
+// at all.
+const ChatMarkdown = lazy(() => import("./ChatMarkdown"));
+
 import {
   Copy,
   ExternalLink,
@@ -53,6 +33,11 @@ export interface MessageBlockProps {
   /** Save THIS single assistant response (and its preceding user prompt) as a note. */
   onSaveAsNote?: () => void;
   onRegenerate?: () => void;
+  /** Label shown above an assistant turn. Defaults to "claude" but
+   *  should be the actual provider/model in use (e.g. "gpt-5.2",
+   *  "gemini-2.0", "gemma-4-e4b") so the chat doesn't lie about
+   *  which model spoke. Lower-cased + truncated for display. */
+  assistantLabel?: string;
 }
 
 // Memoized so a token append to the LAST assistant message doesn't
@@ -62,6 +47,7 @@ export const MessageBlock = memo(MessageBlockImpl, (prev, next) => {
   if (prev.onOpenAsTab !== next.onOpenAsTab) return false;
   if (prev.onSaveAsNote !== next.onSaveAsNote) return false;
   if (prev.onRegenerate !== next.onRegenerate) return false;
+  if (prev.assistantLabel !== next.assistantLabel) return false;
   const a = prev.msg;
   const b = next.msg;
   if (a.kind !== b.kind) return false;
@@ -87,6 +73,7 @@ function MessageBlockImpl({
   onOpenAsTab,
   onSaveAsNote,
   onRegenerate,
+  assistantLabel,
 }: MessageBlockProps) {
   if (msg.kind === "tool") {
     if (msg.result !== undefined) {
@@ -176,7 +163,14 @@ function MessageBlockImpl({
     );
   }
 
-  const roleLabel = msg.kind === "user" ? "you" : "claude";
+  // Assistant label: use the actual provider/model when available, fall
+  // back to "claude" only if nothing was passed (legacy callers). Lower
+  // case + collapse whitespace so long names like "GPT-5.2" / "claude-
+  // opus-4-7" / "gemma-4-e4b-it-q8_0" stay readable as a tiny eyebrow.
+  const roleLabel =
+    msg.kind === "user"
+      ? "you"
+      : (assistantLabel || "claude").toLowerCase().trim();
   const body =
     msg.kind === "assistant" ? stripToolCallProtocol(msg.content) : msg.content;
 
@@ -210,13 +204,27 @@ function MessageBlockImpl({
             fontFamily: "var(--font-text)",
           }}
         >
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeKatex, rehypeHighlight]}
-            components={CHAT_MD_COMPONENTS}
-          >
-            {body}
-          </ReactMarkdown>
+          {msg.streaming ? (
+            // While the model is still emitting tokens, render plain
+            // pre-wrap text. The full unified pipeline (remark-gfm +
+            // remark-math + rehype-katex + rehype-highlight) costs
+            // 5-50ms per parse and was firing on every RAF batch, which
+            // pegged the main thread on long completions. The user sees
+            // identical text either way; markdown formatting kicks in
+            // the moment streaming finishes (the `streaming === false`
+            // branch below).
+            <div style={{ whiteSpace: "pre-wrap" }}>{body}</div>
+          ) : (
+            // Suspense fallback: same plain-text render as streaming
+            // mode, so the moment streaming flips off there's no
+            // visual jump while the markdown chunk loads (~50-150 ms
+            // first hit, instant after).
+            <Suspense
+              fallback={<div style={{ whiteSpace: "pre-wrap" }}>{body}</div>}
+            >
+              <ChatMarkdown body={body} />
+            </Suspense>
+          )}
           {msg.streaming && <span className="forge-msg__caret" aria-hidden />}
         </div>
       ) : (

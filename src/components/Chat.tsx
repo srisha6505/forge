@@ -17,6 +17,7 @@ import {
 import { GhostBtn, Chip } from "./ui";
 import { RunningIndicator } from "./chat/RunningIndicator";
 import { MessageBlock, type UiMessage } from "./chat/MessageBlock";
+import { VoiceInput } from "./VoiceInput";
 import {
   connectInference,
   listChats,
@@ -330,6 +331,35 @@ const Chat = forwardRef<ChatHandle, Props>(function Chat(
   const tokenEstimate = useMemo(() => estimateTokens(messages), [messages]);
   void tokenEstimate;
 
+  // Auto-connect on mount: try the saved provider/model once silently.
+  // The user's most recent successful provider lives in settings (vault
+  // + global). connect_inference reads from there, so if anything is
+  // configured we'll come up "connected" with the right model label
+  // showing in the chip. Silent failure = stay at "not connected" until
+  // the user configures something or sends a message (which retries).
+  useEffect(() => {
+    if (connected) return;
+    let cancelled = false;
+    connectInference()
+      .then((res) => {
+        if (cancelled) return;
+        setModelLabel(res.model_name);
+        setConnected(true);
+        setContextLimit(inferContextLimit(res.model_name));
+      })
+      .catch(() => {
+        // Expected on a fresh vault with no provider configured. Don't
+        // surface as an error toast — the user picks a provider in
+        // Settings and we'll retry on next send().
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Run only once per mount; reconnect logic on provider change is
+    // handled by the explicit retry inside send().
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const send = async () => {
     const text = input.trim();
     if (!text || busy) return;
@@ -553,6 +583,7 @@ const Chat = forwardRef<ChatHandle, Props>(function Chat(
               key={i}
               msg={m}
               isLast={i === messages.length - 1}
+              assistantLabel={modelLabel === "not connected" ? undefined : modelLabel}
               onOpenAsTab={
                 persistedId
                   ? () => onOpenChatAsTab(persistedId, headerTitle)
@@ -578,23 +609,35 @@ const Chat = forwardRef<ChatHandle, Props>(function Chat(
           border: "1px solid var(--background-modifier-border)",
           borderRadius: "var(--radius-m)",
           display: "flex",
-          alignItems: "center",
+          alignItems: "flex-end",
           padding: "6px 10px",
           gap: 8,
         }}
       >
         <Chip onClick={onOpenAiSettings}>{modelLabel}</Chip>
-        <input
+        <textarea
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          rows={1}
+          onChange={(e) => {
+            setInput(e.target.value);
+            // Auto-grow: reset to min height first to let scrollHeight
+            // shrink when text is deleted, then expand to fit content
+            // up to ~6 lines (~144 px). Past that we let the textarea
+            // scroll internally rather than push the composer up
+            // forever and squash the chat above it.
+            const ta = e.currentTarget;
+            ta.style.height = "auto";
+            ta.style.height = Math.min(ta.scrollHeight, 144) + "px";
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               if (busy) stop();
               else send();
             }
+            // Shift+Enter falls through, native textarea inserts \n.
           }}
-          placeholder={busy ? "Streaming..." : "Ask anything..."}
+          placeholder={busy ? "Streaming..." : "Ask anything... (Shift+Enter for newline)"}
           disabled={busy}
           style={{
             flex: 1,
@@ -604,7 +647,19 @@ const Chat = forwardRef<ChatHandle, Props>(function Chat(
             fontSize: "var(--font-ui-medium)",
             color: "var(--text-normal)",
             minWidth: 0,
+            resize: "none",
+            fontFamily: "inherit",
+            lineHeight: 1.45,
+            padding: "4px 0",
+            maxHeight: 144,
+            overflowY: "auto",
           }}
+        />
+        <VoiceInput
+          onTranscript={(t) =>
+            setInput((prev) => (prev ? prev + (prev.endsWith(" ") ? "" : " ") + t : t))
+          }
+          disabled={busy}
         />
         <button
           onClick={busy ? stop : send}
@@ -626,6 +681,8 @@ const Chat = forwardRef<ChatHandle, Props>(function Chat(
             alignItems: "center",
             justifyContent: "center",
             cursor: input.trim() || busy ? "pointer" : "default",
+            flexShrink: 0,
+            alignSelf: "flex-end",
           }}
         >
           <Send size={14} />
