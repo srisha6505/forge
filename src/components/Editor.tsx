@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
@@ -32,6 +32,12 @@ interface Props {
   // by cm-wikilinks to gate which short refs become clickable. Returns
   // the resolved file path on hit, null on miss.
   resolveTarget?: (target: string) => string | null;
+  // When set, scroll the editor to this 1-based line and (optionally)
+  // briefly highlight the listed terms. Owner state lives in App.tsx;
+  // we call onScrollConsumed once the jump runs so the same value
+  // doesn't keep retriggering.
+  pendingScroll?: { line: number; highlight?: string[] } | null;
+  onScrollConsumed?: () => void;
 }
 
 // Extract h1-h6 headings from raw markdown via a line-scan regex. Not
@@ -70,6 +76,8 @@ function Editor({
   onOpenPath,
   onEditorMount,
   resolveTarget,
+  pendingScroll,
+  onScrollConsumed,
 }: Props) {
   // Fresh-ref pattern: refs assigned during render so the CM6 extension
   // closures (built once via useMemo) always forward to the latest
@@ -78,6 +86,10 @@ function Editor({
   const onOpenRef = useRef(onOpenPath);
   const pathRef = useRef(path);
   const viewRef = useRef<EditorView | null>(null);
+  // Render-tick that flips when CodeMirror mounts. The pendingScroll
+  // effect depends on it so a jump that arrived BEFORE the editor was
+  // ready still fires once the view exists.
+  const [viewReady, setViewReady] = useState(0);
   const resolveRef = useRef<((t: string) => string | null) | null>(
     resolveTarget ?? null,
   );
@@ -122,6 +134,38 @@ function Editor({
     () => (tocOpen ? extractHeadings(content) : []),
     [tocOpen, content],
   );
+
+  // External jump trigger (Search → click result). The owner sets
+  // `pendingScroll` on the active tab; we dispatch the same caret-move +
+  // scrollIntoView combo as TOC, then notify the owner to clear the
+  // field. Re-runs when `path` or `pendingScroll.line` change so the
+  // user can jump from search to the same file twice in a row.
+  useEffect(() => {
+    if (!pendingScroll) return;
+    const view = viewRef.current;
+    if (!view) return;
+    const target = Math.max(
+      1,
+      Math.min(pendingScroll.line, view.state.doc.lines),
+    );
+    const line = view.state.doc.line(target);
+    view.dispatch({
+      selection: EditorSelection.cursor(line.from),
+      effects: EditorView.scrollIntoView(line.from, {
+        y: "start",
+        yMargin: 24,
+      }),
+    });
+    requestAnimationFrame(() => {
+      const lineEl = view.domAtPos(line.from).node as HTMLElement | null;
+      lineEl?.scrollIntoView?.({ block: "start", behavior: "auto" });
+    });
+    onScrollConsumed?.();
+    // Intentionally exclude onScrollConsumed: it changes identity on
+    // every render of the parent, which would otherwise re-fire this
+    // effect with no real change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, pendingScroll?.line, viewReady]);
 
   // Click-to-scroll wiring for the TOC. We dispatch a caret move + CM
   // scrollIntoView; CM measures and scrolls the .cm-scroller. The OUTER
@@ -216,6 +260,7 @@ function Editor({
             theme="none"
             onCreateEditor={(view) => {
               viewRef.current = view;
+              setViewReady((n) => n + 1);
               onEditorMount?.(view);
             }}
             basicSetup={{

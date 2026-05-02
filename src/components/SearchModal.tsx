@@ -5,9 +5,11 @@ import {
   useMemo,
   useRef,
   useState,
+  useTransition,
 } from "react";
 import {
   FileText,
+  Hash,
   Loader2,
   RefreshCw,
   Search as SearchIcon,
@@ -20,26 +22,22 @@ import {
   type SearchHit,
   type SearchStatus,
 } from "../lib/tauri";
+import { SearchSnippet } from "./SearchSnippet";
 
 interface Props {
   open: boolean;
   onClose: () => void;
-  onOpenFile: (path: string, options?: { newTab?: boolean }) => void;
+  onOpenFile: (
+    path: string,
+    options?: {
+      newTab?: boolean;
+      jumpToLine?: number;
+      highlight?: string[];
+    },
+  ) => void;
 }
 
 const DEBOUNCE_MS = 150;
-
-function snippetToPlain(s: string): string {
-  return s
-    .replace(/\*\*([^*\n]+?)\*\*/g, "$1")
-    .replace(/(?<!\*)\*([^*\n]+?)\*(?!\*)/g, "$1")
-    .replace(/`([^`\n]+?)`/g, "$1")
-    .replace(/\[\[([^\]|\n]+?)(?:\|([^\]\n]+?))?\]\]/g, (_m, t, a) => a || t)
-    .replace(/\[([^\]\n]+?)\]\([^)\n]+?\)/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 // ── Memoised result row. Only re-renders if its hit / selected state /
 // callbacks change. Result list re-renders are gated to debounced
@@ -47,34 +45,30 @@ function snippetToPlain(s: string): string {
 
 interface RowProps {
   hit: SearchHit;
+  idx: number;
   isSelected: boolean;
-  onSelect: () => void;
-  onOpen: (newTab: boolean) => void;
 }
 
-const ResultRow = memo(function ResultRow({
-  hit,
-  isSelected,
-  onSelect,
-  onOpen,
-}: RowProps) {
+const ResultRow = memo(function ResultRow({ hit, idx, isSelected }: RowProps) {
+  const isVector = hit.source === "vector";
   return (
     <button
-      onMouseEnter={onSelect}
-      onClick={(e) => onOpen(e.ctrlKey || e.metaKey)}
-      className={`w-full text-left px-4 py-3 border-b border-[var(--background-modifier-border)] flex items-start gap-3 ${
+      data-idx={idx}
+      className={`row w-full text-left px-4 py-3 border-b border-[var(--background-modifier-border)] flex items-start gap-3 transition-colors ${
         isSelected
           ? "bg-[var(--background-modifier-active)]"
           : "hover:bg-[var(--background-modifier-hover)]"
       }`}
     >
       <FileText
-        size={15}
+        size={14}
         strokeWidth={1.8}
-        className={`mt-0.5 flex-shrink-0 ${
+        className={`mt-1 flex-shrink-0 ${
           isSelected
             ? "text-[var(--text-accent)]"
-            : "text-[var(--text-faint)]"
+            : isVector
+              ? "text-[var(--text-faint)] opacity-60"
+              : "text-[var(--text-faint)]"
         }`}
       />
       <div className="flex-1 min-w-0">
@@ -86,19 +80,41 @@ const ResultRow = memo(function ResultRow({
                 : "text-[var(--text-normal)]"
             }`}
           >
-            {hit.title}
+            <SearchSnippet
+              source={hit.title}
+              highlightTerms={hit.matched_terms}
+              plain
+            />
           </div>
-          <div className="text-[10px] text-[var(--text-faint)] tabular-nums flex-shrink-0">
-            {hit.score.toFixed(2)}
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {isVector && (
+              <span
+                className="text-[9px] uppercase tracking-[0.12em] px-1.5 py-0.5 rounded text-[var(--text-faint)] border border-[var(--background-modifier-border)]"
+                title="Semantic neighbour — no keyword hit in this chunk"
+              >
+                related
+              </span>
+            )}
+            <div className="text-[10px] text-[var(--text-faint)] tabular-nums">
+              {hit.score.toFixed(2)}
+            </div>
           </div>
         </div>
-        {hit.heading && (
-          <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] truncate mb-1">
-            {hit.heading}
+        {hit.heading && hit.heading !== "(top)" && (
+          <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-[var(--text-muted)] truncate mb-1">
+            <Hash size={10} strokeWidth={2.2} className="flex-shrink-0" />
+            <SearchSnippet
+              source={hit.heading.replace(/^#+\s*/, "")}
+              highlightTerms={hit.matched_terms}
+              plain
+            />
           </div>
         )}
         <div className="text-[12px] text-[var(--text-muted)] line-clamp-2 leading-snug">
-          {snippetToPlain(hit.snippet)}
+          <SearchSnippet
+            source={hit.snippet}
+            highlightTerms={hit.matched_terms}
+          />
         </div>
       </div>
     </button>
@@ -111,30 +127,47 @@ const ResultRow = memo(function ResultRow({
 interface ResultsProps {
   hits: SearchHit[];
   selected: number;
-  onSelect: (i: number) => void;
-  onOpen: (path: string, newTab: boolean) => void;
-  onClose: () => void;
 }
 
 const ResultsList = memo(function ResultsList({
   hits,
   selected,
-  onSelect,
-  onOpen,
-  onClose,
 }: ResultsProps) {
+  // Group: keyword/literal first, then vector ("related") below a
+  // visual divider. Both keep their original ranking inside the group.
+  const direct: { hit: SearchHit; idx: number }[] = [];
+  const related: { hit: SearchHit; idx: number }[] = [];
+  hits.forEach((hit, idx) => {
+    if (hit.source === "vector") related.push({ hit, idx });
+    else direct.push({ hit, idx });
+  });
+
   return (
     <>
-      {hits.map((hit, i) => (
+      {direct.map(({ hit, idx }) => (
         <ResultRow
-          key={`${hit.path}-${i}`}
+          key={`${hit.path}-${idx}`}
           hit={hit}
-          isSelected={i === selected}
-          onSelect={() => onSelect(i)}
-          onOpen={(newTab) => {
-            onOpen(hit.path, newTab);
-            onClose();
-          }}
+          idx={idx}
+          isSelected={idx === selected}
+        />
+      ))}
+      {related.length > 0 && direct.length > 0 && (
+        <div className="px-4 py-2 text-[10px] uppercase tracking-[0.12em] text-[var(--text-faint)] bg-[var(--background-secondary)] border-b border-[var(--background-modifier-border)]">
+          Related (semantic)
+        </div>
+      )}
+      {related.length > 0 && direct.length === 0 && (
+        <div className="px-4 py-2 text-[10px] uppercase tracking-[0.12em] text-[var(--text-faint)] bg-[var(--background-secondary)] border-b border-[var(--background-modifier-border)]">
+          No keyword match — semantic neighbours
+        </div>
+      )}
+      {related.map(({ hit, idx }) => (
+        <ResultRow
+          key={`${hit.path}-${idx}`}
+          hit={hit}
+          idx={idx}
+          isSelected={idx === selected}
         />
       ))}
     </>
@@ -158,6 +191,22 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceTimer = useRef<number | null>(null);
   const requestId = useRef(0);
+  // React 18 transition: deprioritises the result re-render so a
+  // burst of keystrokes doesn't queue behind a 30-row reconciliation.
+  // The input stays at default priority and never freezes.
+  const [, startTransition] = useTransition();
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Latest hits in a ref so the delegated click handler can read them
+  // without becoming part of its dep list (which would re-bind handlers).
+  const hitsRef = useRef<SearchHit[]>([]);
+  hitsRef.current = hits;
+  // Progressive render. Bigger lists than this are rare with 30-result
+  // backend cap, but the cost shape is what matters: rendering 12 rows
+  // is ~3x cheaper than rendering 30 on webkit2gtk, and the user almost
+  // never scrolls past the first page — so most searches do 12 rows of
+  // work, not 30.
+  const PAGE_SIZE = 12;
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
   // Open / close lifecycle.
   useEffect(() => {
@@ -206,8 +255,19 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
     searchVault(searchQuery, 30)
       .then((results) => {
         if (id !== requestId.current) return;
-        setHits(results);
-        setSelected(0);
+        // Mark the heavy result re-render as a transition so React keeps
+        // the input handler responsive. Without this the typing cursor
+        // freezes for 50-150ms while 30 rows reconcile on webkit2gtk.
+        startTransition(() => {
+          setHits(results);
+          setSelected(0);
+          setVisibleCount(PAGE_SIZE);
+          // Snap the scroll container back to the top so the first page
+          // is what the user sees after a new query.
+          if (scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTop = 0;
+          }
+        });
         searchStatus().then(setStatus).catch(() => {});
       })
       .catch((e) => {
@@ -219,6 +279,19 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
         if (id === requestId.current) setBusy(false);
       });
   }, [open, searchQuery]);
+
+  // Scroll the keyboard-selected row into view. Runs after the DOM
+  // commit so the row's offset is final. `block: "nearest"` keeps
+  // movement minimal — only scrolls when the row is actually clipped.
+  useEffect(() => {
+    const root = scrollContainerRef.current;
+    if (!root) return;
+    const el = root.querySelector<HTMLButtonElement>(
+      `button[data-idx="${selected}"]`,
+    );
+    if (!el) return;
+    el.scrollIntoView({ block: "nearest", behavior: "auto" });
+  }, [selected, hits]);
 
   const handleReindex = useCallback(async () => {
     setReindexing(true);
@@ -239,12 +312,76 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
     }
   }, []);
 
-  // Stable callbacks for memoised children.
-  const handleSelect = useCallback((i: number) => setSelected(i), []);
-  const handleOpen = useCallback(
-    (path: string, newTab: boolean) =>
-      onOpenFile(path, { newTab }),
-    [onOpenFile],
+  // Reveal another page when the scroll container nears its bottom.
+  // Reads scroll metrics directly off the event target — cheap, no
+  // IntersectionObserver setup. Threshold 200px gives the next page
+  // time to render before the user sees a flash of empty space.
+  const handleScroll = useCallback(
+    (e: React.UIEvent<HTMLDivElement>) => {
+      const el = e.currentTarget;
+      const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (remaining < 200) {
+        setVisibleCount((c) => {
+          if (c >= hitsRef.current.length) return c;
+          return Math.min(c + PAGE_SIZE, hitsRef.current.length);
+        });
+      }
+    },
+    [],
+  );
+
+  // When the user keyboard-navigates past the visible window, expand
+  // the window so the selected row can actually render and scroll into
+  // view. Without this, ArrowDown past idx 11 selects nothing visible.
+  useEffect(() => {
+    if (selected >= visibleCount && selected < hits.length) {
+      setVisibleCount(
+        Math.min(
+          Math.max(selected + 1, visibleCount + PAGE_SIZE),
+          hits.length,
+        ),
+      );
+    }
+  }, [selected, visibleCount, hits.length]);
+
+  const visibleHits = useMemo(
+    () => hits.slice(0, visibleCount),
+    [hits, visibleCount],
+  );
+
+  // Single delegated handlers — never rebind, so ResultRow's memo can
+  // skip every row except the previously-/newly-selected one on arrow
+  // navigation. The rows carry their `idx` as a data attribute and the
+  // handler reads it from the closest button ancestor.
+  const handleListMouseOver = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
+        "button[data-idx]",
+      );
+      if (!btn) return;
+      const idx = parseInt(btn.dataset.idx ?? "", 10);
+      if (Number.isFinite(idx)) setSelected(idx);
+    },
+    [],
+  );
+
+  const handleListClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
+        "button[data-idx]",
+      );
+      if (!btn) return;
+      const idx = parseInt(btn.dataset.idx ?? "", 10);
+      const hit = hitsRef.current[idx];
+      if (!hit) return;
+      onOpenFile(hit.path, {
+        newTab: e.ctrlKey || e.metaKey,
+        jumpToLine: hit.line_start,
+        highlight: hit.matched_terms,
+      });
+      onClose();
+    },
+    [onOpenFile, onClose],
   );
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -259,7 +396,12 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
       setSelected((s) => Math.max(0, s - 1));
     } else if (e.key === "Enter" && hits[selected]) {
       e.preventDefault();
-      handleOpen(hits[selected].path, e.ctrlKey || e.metaKey);
+      const hit = hits[selected];
+      onOpenFile(hit.path, {
+        newTab: e.ctrlKey || e.metaKey,
+        jumpToLine: hit.line_start,
+        highlight: hit.matched_terms,
+      });
       onClose();
     }
   };
@@ -267,10 +409,13 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
   const placeholder = useMemo(() => {
     if (!status?.indexed) return "Search vault — first run will build the index…";
     const mode = status.vectors_available ? "hybrid" : "BM25";
-    return `Search ${status.chunk_count} chunks (${mode}) — "quotes" for keyword only`;
+    return `Search ${status.chunk_count} chunks (${mode}) — "quotes" for exact match`;
   }, [status]);
 
   if (!open) return null;
+
+  const hasQuery = searchQuery.trim().length > 0;
+  const isQuoted = searchQuery.trim().startsWith('"');
 
   return (
     <div
@@ -295,6 +440,14 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
             placeholder={placeholder}
             className="flex-1 text-[18px] py-1 outline-none bg-transparent text-[var(--text-normal)] placeholder:text-[var(--text-faint)]"
           />
+          {isQuoted && (
+            <span
+              className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-md bg-[var(--text-accent)]/15 text-[var(--text-accent)] flex-shrink-0"
+              title="Quoted query → exact substring, no stemming, no semantic"
+            >
+              exact
+            </span>
+          )}
           {busy && (
             <Loader2
               size={18}
@@ -311,13 +464,19 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 overflow-y-auto"
+          onMouseOver={handleListMouseOver}
+          onClick={handleListClick}
+          onScroll={handleScroll}
+        >
           {error && (
             <div className="m-4 p-3 rounded-md bg-[var(--background-modifier-error)] text-[var(--text-error)] text-[12px] font-mono whitespace-pre-wrap">
               {error}
             </div>
           )}
-          {!error && hits.length === 0 && searchQuery.trim() && !busy && (
+          {!error && hits.length === 0 && hasQuery && !busy && (
             <div className="px-4 py-12 text-center">
               <div className="text-[13px] text-[var(--text-muted)] mb-2">
                 No results for &ldquo;{searchQuery}&rdquo;
@@ -340,20 +499,20 @@ export default function SearchModal({ open, onClose, onOpenFile }: Props) {
               </button>
             </div>
           )}
-          {!error && hits.length === 0 && !searchQuery.trim() && (
-            <div className="px-4 py-16 text-center text-[12px] text-[var(--text-faint)]">
+          {!error && hits.length === 0 && !hasQuery && (
+            <div className="px-4 py-16 text-center text-[12px] text-[var(--text-faint)] leading-relaxed">
               Type to search across your vault.
               <br />
-              Wrap in &ldquo;quotes&rdquo; for keyword-only (BM25) search.
+              Wrap in &ldquo;quotes&rdquo; for exact-substring match (no
+              stemming, no semantic).
             </div>
           )}
-          <ResultsList
-            hits={hits}
-            selected={selected}
-            onSelect={handleSelect}
-            onOpen={handleOpen}
-            onClose={onClose}
-          />
+          <ResultsList hits={visibleHits} selected={selected} />
+          {visibleCount < hits.length && (
+            <div className="px-4 py-3 text-center text-[10px] text-[var(--text-faint)] tabular-nums">
+              {hits.length - visibleCount} more — scroll to load
+            </div>
+          )}
         </div>
 
         <div className="flex-shrink-0 px-4 py-2 border-t border-[var(--background-modifier-border)] flex items-center justify-between text-[11px] text-[var(--text-faint)]">

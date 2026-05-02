@@ -258,6 +258,14 @@ export interface SearchHit {
   heading: string;
   snippet: string;
   score: number;
+  /** 1-based line number where the chunk begins. */
+  line_start: number;
+  /** Lowercased query terms (or the literal needle for quoted queries)
+   * that the renderer should highlight. Empty for vector-only hits. */
+  matched_terms: string[];
+  /** "keyword" → BM25/FTS hit, "vector" → semantic-only neighbour,
+   * "literal" → quoted substring match. */
+  source: "keyword" | "vector" | "literal";
 }
 
 export interface SearchStatus {
