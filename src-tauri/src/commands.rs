@@ -287,6 +287,16 @@ pub struct SearchHit {
     pub heading: String,
     pub snippet: String,
     pub score: f32,
+    /// 1-based line number where the chunk starts. Used to scroll the
+    /// editor to the right place when the user clicks the result.
+    pub line_start: usize,
+    /// Lowercased query terms (or the literal needle for quoted queries)
+    /// that the renderer should highlight in title/heading/snippet.
+    /// Empty for vector-only hits.
+    pub matched_terms: Vec<String>,
+    /// "keyword" | "vector" | "literal" — lets the UI badge vector-only
+    /// hits and segment them visually from keyword matches.
+    pub source: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -457,22 +467,30 @@ pub fn search_vault(
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // UTF-8-safe truncation: clamp to char boundary, not byte boundary.
-            let snippet = if r.chunk.content.chars().count() > 240 {
-                let mut end = 0usize;
-                for (i, _) in r.chunk.content.char_indices().take(240) {
-                    end = i;
-                }
-                format!("{}…", r.chunk.content[..end].trim_end())
-            } else {
-                r.chunk.content.clone()
-            };
+            let snippet = crate::search::build_snippet_for_hit(
+                &r.chunk.content,
+                &r.matched_terms,
+                240,
+            );
+            let line_start = crate::search::line_for_chunk(
+                &r.chunk.file_path,
+                r.chunk.byte_start,
+            );
+            let source = match r.source {
+                crate::search::HitSource::Keyword => "keyword",
+                crate::search::HitSource::Vector => "vector",
+                crate::search::HitSource::Literal => "literal",
+            }
+            .to_string();
             SearchHit {
                 path: r.chunk.file_path.to_string_lossy().to_string(),
                 title,
                 heading: r.chunk.heading,
                 snippet,
                 score: r.score,
+                line_start,
+                matched_terms: r.matched_terms,
+                source,
             }
         })
         .collect())

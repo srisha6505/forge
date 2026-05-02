@@ -1,9 +1,22 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// MiniLM-L6 was trained with a 512-token positional embedding table. A
+/// chunk longer than that produces a position id that overflows the
+/// table; depending on which BLAS path candle picks the symptoms range
+/// from a clean Result::Err to an aborted process (the C++ side bypasses
+/// Rust panics, and catch_unwind doesn't see it). 256 leaves comfortable
+/// headroom and is what most sentence-encoder retrieval setups use.
+const MAX_TOKENS: usize = 256;
+/// Hard char cap before we even tokenise. Tokenizers can spend a
+/// surprising amount of time chewing through tens of MB of text only to
+/// throw most of it away after truncation; this gates the pathological
+/// pdftotext-output-on-one-line case at the door.
+const MAX_INPUT_CHARS: usize = 4096;
 
 pub struct LocalEmbedder {
     model: BertModel,
@@ -18,8 +31,22 @@ impl LocalEmbedder {
         let weights_path = repo.get("model.safetensors")?;
         let config_path = repo.get("config.json")?;
 
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|e| format!("{}", e))?;
+
+        // Force the tokenizer to truncate on the right at MAX_TOKENS so
+        // embed() can never feed BertModel a sequence longer than the
+        // model's positional embedding table. Without this, a single
+        // long chunk (a PDF body extracted via pdftotext, no headings)
+        // overflows the table and the process aborts.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                direction: TruncationDirection::Right,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+            }))
+            .map_err(|e| format!("tokenizer truncation: {}", e))?;
 
         let device = Device::Cpu;
         let config: Config =
@@ -33,12 +60,34 @@ impl LocalEmbedder {
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        // Pre-truncate at the char level so we don't ask the tokenizer to
+        // chew through (and immediately discard) tens of MB of PDF text.
+        let trimmed: String;
+        let input: &str = if text.chars().count() > MAX_INPUT_CHARS {
+            trimmed = text.chars().take(MAX_INPUT_CHARS).collect();
+            &trimmed
+        } else {
+            text
+        };
+
         let encoding = self
             .tokenizer
-            .encode(text, true)
+            .encode(input, true)
             .map_err(|e| format!("{}", e))?;
         let tokens = encoding.get_ids();
-        let token_ids = Tensor::new(tokens, &Device::Cpu)?.unsqueeze(0)?;
+        // Final belt-and-braces: even with tokenizer truncation set, we
+        // verify the slice is within MAX_TOKENS before constructing the
+        // tensor. Any future regression in tokenizer config would still
+        // be caught here.
+        let safe_tokens = if tokens.len() > MAX_TOKENS {
+            &tokens[..MAX_TOKENS]
+        } else {
+            tokens
+        };
+        if safe_tokens.is_empty() {
+            return Err("empty token sequence after tokenisation".into());
+        }
+        let token_ids = Tensor::new(safe_tokens, &Device::Cpu)?.unsqueeze(0)?;
         let token_type_ids = token_ids.zeros_like()?;
 
         let embeddings = self.model.forward(&token_ids, &token_type_ids, None)?;

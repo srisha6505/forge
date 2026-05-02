@@ -39,6 +39,10 @@ byteorder = "1"
 webrtc-vad = "0.4"
 base64 = "0.22"
 portable-pty = "0.8"
+# DOCX text extraction. DOCX is a zip with `word/document.xml`; we use
+# zip 2.x (pure Rust, deflate only — we don't need every codec) and
+# strip XML tags with a tiny hand parser to avoid pulling in quick-xml.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # mimalloc as the global allocator. Default glibc malloc fragments
 # heavily under our workload (chunked SQLite reads, candle tensors,
 # embedder spans), and switching to mimalloc gives ~10-20% speedup
