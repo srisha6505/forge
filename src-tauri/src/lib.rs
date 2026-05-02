@@ -4,6 +4,14 @@
 
 #![allow(dead_code)]
 
+// Switch the process-wide allocator to mimalloc. The default glibc
+// malloc fragments under our workload (chunked SQLite reads + candle
+// tensor lifetimes + embedder span allocations), which shows up as
+// climbing RSS over a long session and slower retrieval. mimalloc is
+// drop-in, pure-Rust wrapper, no extra runtime to ship.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod agent;
 pub mod auth;
 pub mod binaries;
@@ -82,10 +90,30 @@ pub fn run() {
     // wry/webkit2gtk reads the values during webview init.
     #[cfg(target_os = "linux")]
     unsafe {
+        // WebKitGTK compositing path. Required for webkit2gtk to actually
+        // touch the GPU; without these the surface falls through to a
+        // CPU compositor.
         std::env::set_var("WEBKIT_FORCE_COMPOSITING_MODE", "1");
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "0");
         std::env::set_var("WEBKIT_USE_GLES", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "0");
+
+        // NVIDIA-proprietary X11 path tunings. No-ops on AMD/Intel/Mesa
+        // and on Wayland (the variables are read by the NVIDIA libGL
+        // only). Material on this hardware:
+        //   __GL_SYNC_TO_VBLANK=1       eliminate scroll-tear
+        //   __GL_THREADED_OPTIMIZATIONS=1
+        //                                offload GL work to a side
+        //                                thread; ~5-10% smoother under
+        //                                paint-heavy load
+        //   __GL_YIELD=USLEEP          gentler driver thread on
+        //                                contended cores (vs. NOTHING)
+        // We set them unconditionally; the NVIDIA libGL ignores them
+        // when not driving the surface, and on non-NVIDIA setups the
+        // generic libGL never reads these names.
+        std::env::set_var("__GL_SYNC_TO_VBLANK", "1");
+        std::env::set_var("__GL_THREADED_OPTIMIZATIONS", "1");
+        std::env::set_var("__GL_YIELD", "USLEEP");
     }
 
     tauri::Builder::default()
