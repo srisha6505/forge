@@ -22,12 +22,13 @@ import {
 } from "lucide-react";
 import { assetUrl } from "../lib/file-types";
 
-// pdfjs worker version pinning. `vite.config.ts` aliases `pdfjs-dist`
-// to react-pdf's nested copy, so `pdfjs.version` reflects the exact
-// version react-pdf's Document expects. Fetching the matching worker
-// from unpkg is simpler than self-hosting (the ?url asset import
-// conflicts with Vite's dep optimizer on bare specifiers).
-pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+// pdf.js worker bundled locally. The `?url` suffix tells Vite to emit
+// the worker as an asset and give us its hashed URL; npm hoisting puts
+// pdfjs-dist at the top level, so this resolves to the same version
+// `react-pdf` expects. Replaces an `unpkg.com` fetch that blocked the
+// first PDF open on a network round trip.
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 interface Props {
   path: string;

@@ -1,5 +1,8 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+// SWC backend instead of Babel. Identical API surface for our use, but
+// HMR is ~5-10× faster and dev-server cold start drops noticeably. No
+// runtime impact — the swap only affects how Vite transforms TSX.
+import react from "@vitejs/plugin-react-swc";
 
 // @ts-ignore process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -50,6 +53,53 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": "/src",
+    },
+  },
+  build: {
+    // Tauri's webview is always recent (webkit2gtk 2.50+, WebView2,
+    // WKWebView). Modern ES target lets esbuild skip down-level
+    // transforms that old browsers need.
+    target: "es2022",
+    // Splitting heavy vendors into their own chunks: webkit2gtk parses
+    // chunks in parallel and the user's HTTP cache survives across
+    // rebuilds for anything they didn't touch. Pre-split the bundle
+    // showed a 5.4 MB monolithic index-*.js which dominated cold-start
+    // parse cost on webkit2gtk; carving out the four heaviest gets that
+    // down to ~1.5 MB main + parallel vendor chunks.
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/mermaid/")) return "vendor-mermaid";
+          if (id.includes("/cytoscape")) return "vendor-cytoscape";
+          if (id.includes("/@codemirror/") || id.includes("/codemirror/"))
+            return "vendor-codemirror";
+          if (id.includes("/katex/")) return "vendor-katex";
+          if (id.includes("/highlight.js/")) return "vendor-highlight";
+          if (id.includes("/react-pdf/") || id.includes("/pdfjs-dist/"))
+            return "vendor-pdf";
+          if (
+            id.includes("/react-markdown/") ||
+            id.includes("/remark") ||
+            id.includes("/rehype") ||
+            id.includes("/micromark") ||
+            id.includes("/mdast") ||
+            id.includes("/hast")
+          )
+            return "vendor-markdown";
+          if (id.includes("/d3-") || id.includes("/react-force-graph"))
+            return "vendor-graph";
+          if (id.includes("/lucide-react/")) return "vendor-icons";
+          if (id.includes("/mammoth/")) return "vendor-docx";
+          if (
+            id.includes("/react/") ||
+            id.includes("/react-dom/") ||
+            id.includes("/scheduler/")
+          )
+            return "vendor-react";
+          return undefined;
+        },
+      },
     },
   },
 }));
