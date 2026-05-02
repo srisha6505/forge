@@ -57,19 +57,23 @@ import Sidebar, {
 import Search from "./components/Search";
 import SearchModal from "./components/SearchModal";
 import Editor from "./components/Editor";
-import LatexViewer from "./components/LatexViewer";
-import DocxViewer from "./components/DocxViewer";
-import PdfViewer from "./components/PdfViewer";
 import ImageViewer from "./components/ImageViewer";
-// Lazy-load both settings modals — they're heavy (~1600 lines of provider
-// + tab UI) and only render when the user clicks the gear or sparkles
-// icon. Splitting them out shrinks the main bundle and means the modal
-// chunk is fetched on demand. Subsequent opens are instant (cached).
+// Heavy viewers are all lazy-loaded so users who never open a PDF /
+// Word doc / LaTeX file / graph view don't pay the parse cost on
+// startup. Each viewer pulls in a substantial vendor tree:
+//   PdfViewer  → react-pdf + pdfjs-dist (~300 KB)
+//   DocxViewer → mammoth (~100 KB)
+//   LatexViewer + GraphView each pull their own subgraphs.
+// First open of each kind is a few hundred ms slower (chunk fetch +
+// parse); after that it's cached for the session.
+const LatexViewer = lazy(() => import("./components/LatexViewer"));
+const DocxViewer = lazy(() => import("./components/DocxViewer"));
+const PdfViewer = lazy(() => import("./components/PdfViewer"));
+const GraphView = lazy(() => import("./components/GraphView"));
 const GeneralSettingsModal = lazy(
   () => import("./components/GeneralSettingsModal"),
 );
 const AISettingsModal = lazy(() => import("./components/AISettingsModal"));
-import GraphView from "./components/GraphView";
 import Chat, { type ChatHandle } from "./components/Chat";
 import ChatTabView, { type ChatTabHandle } from "./components/ChatTabView";
 import ChatHistorySidebar from "./components/ChatHistorySidebar";
@@ -96,6 +100,10 @@ type FileTab = {
   content: string;
   dirty: boolean;
   lastSavedAt: number | null;
+  /** When set, the Editor scrolls to this 1-based line on next mount /
+   * doc swap, then calls back with `id` to clear the field. Used by
+   * Search → click-result navigation. */
+  pendingScroll?: { line: number; highlight?: string[] } | null;
 };
 
 type ChatTab = {
@@ -283,6 +291,13 @@ export default function App() {
           const t = await listVaultTree();
           setTree(t);
           await loadVaultSettings(activeVault);
+          // No boot reindex. The embedder + chunk extraction pipeline
+          // can hit pathological inputs (long PDF chunks > 512 tokens)
+          // that abort the process below the reach of catch_unwind.
+          // Until that's bulletproof, indexing is strictly user-triggered
+          // via the Reindex button. The lazy first-search path still
+          // builds the index from scratch when the vault has never been
+          // indexed.
         }
       } catch (e) {
         console.error("boot error", e);
@@ -599,16 +614,45 @@ export default function App() {
   // ── File / tab operations ─────────────────────────────────────────────
 
   const openFileRef = useRef<
-    (path: string, options?: { newTab?: boolean }) => void
+    (
+      path: string,
+      options?: {
+        newTab?: boolean;
+        jumpToLine?: number;
+        highlight?: string[];
+      },
+    ) => void
   >(() => {});
 
   const openFile = useCallback(
-    async (path: string, options?: { newTab?: boolean }) => {
+    async (
+      path: string,
+      options?: {
+        newTab?: boolean;
+        jumpToLine?: number;
+        highlight?: string[];
+      },
+    ) => {
       await flushPending();
+      const pendingScroll = options?.jumpToLine
+        ? { line: options.jumpToLine, highlight: options.highlight }
+        : null;
       const existing = tabsRef.current.find(
         (t) => t.type === "file" && t.path === path,
       );
       if (existing) {
+        // If the tab is already open, just bump pendingScroll so the
+        // editor re-runs its jump effect. Mutate via state replacement
+        // so React re-renders and the Editor sees the new prop.
+        if (pendingScroll) {
+          setTabs((prev) =>
+            prev.map((t) =>
+              t.id === existing.id && t.type === "file"
+                ? { ...t, pendingScroll }
+                : t,
+            ),
+          );
+        }
         setActiveTabId(existing.id);
         return;
       }
@@ -628,6 +672,7 @@ export default function App() {
         content,
         dirty: false,
         lastSavedAt: null,
+        pendingScroll,
       };
       const currentId = activeTabIdRef.current;
       setTabs((prev) => {
@@ -650,6 +695,18 @@ export default function App() {
     [flushPending],
   );
   openFileRef.current = openFile;
+
+  // Called by Editor when it has consumed a pendingScroll. Clears the
+  // field so the same tab doesn't re-jump on every re-render.
+  const clearPendingScroll = useCallback((tabId: string) => {
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === tabId && t.type === "file" && t.pendingScroll
+          ? { ...t, pendingScroll: null }
+          : t,
+      ),
+    );
+  }, []);
 
   const openChatAsTab = useCallback(
     (chatId: string, title: string) => {
@@ -766,16 +823,29 @@ export default function App() {
     () => ({
       onEditorChange: (v: string) => onEditorChangeRef.current(v),
       openByTarget: (t: string) => openByTargetRef.current(t),
-      openFile: (p: string, opts?: { newTab?: boolean }) =>
-        openFileRef.current(p, opts),
+      openFile: (
+        p: string,
+        opts?: {
+          newTab?: boolean;
+          jumpToLine?: number;
+          highlight?: string[];
+        },
+      ) => openFileRef.current(p, opts),
       openChatAsTab: (chatId: string, title: string) =>
         openChatAsTab(chatId, title),
       // Sync resolver — cm-wikilinks calls this on every `[short-ref]`
       // candidate. Returns the absolute path on hit, null on miss. Same
       // tree-walking logic as openByTarget, just exposed synchronously.
       resolveTarget: (t: string) => resolveInTree(treeRef.current, t),
+      // Stable wrapper so the Editor prop identity doesn't churn each
+      // render (which would defeat Editor's memo wrapper). Reads the
+      // tab id from the latest active tab via a ref.
+      clearActiveScroll: () => {
+        const id = activeTabIdRef.current;
+        if (id) clearPendingScroll(id);
+      },
     }),
-    [openChatAsTab],
+    [openChatAsTab, clearPendingScroll],
   );
 
   // ── Shortcuts ─────────────────────────────────────────────────────────
@@ -1314,20 +1384,24 @@ export default function App() {
               const kind = fileKind(activeTab.path);
               if (kind === "latex") {
                 return (
-                  <LatexViewer
-                    key={activeTab.id}
-                    path={activeTab.path}
-                    title={activeTitle}
-                  />
+                  <Suspense fallback={<ViewerLoadingFallback />}>
+                    <LatexViewer
+                      key={activeTab.id}
+                      path={activeTab.path}
+                      title={activeTitle}
+                    />
+                  </Suspense>
                 );
               }
               if (kind === "pdf") {
                 return (
-                  <PdfViewer
-                    key={activeTab.id}
-                    path={activeTab.path}
-                    title={activeTitle}
-                  />
+                  <Suspense fallback={<ViewerLoadingFallback />}>
+                    <PdfViewer
+                      key={activeTab.id}
+                      path={activeTab.path}
+                      title={activeTitle}
+                    />
+                  </Suspense>
                 );
               }
               if (kind === "image") {
@@ -1341,11 +1415,13 @@ export default function App() {
               }
               if (kind === "docx") {
                 return (
-                  <DocxViewer
-                    key={activeTab.id}
-                    path={activeTab.path}
-                    title={activeTitle}
-                  />
+                  <Suspense fallback={<ViewerLoadingFallback />}>
+                    <DocxViewer
+                      key={activeTab.id}
+                      path={activeTab.path}
+                      title={activeTitle}
+                    />
+                  </Suspense>
                 );
               }
               // One render pipeline for .md (mdeditor.md §1). Editor
@@ -1375,6 +1451,8 @@ export default function App() {
                   tocOpen={tocOpen}
                   onEditorMount={handleEditorMount}
                   resolveTarget={stable.resolveTarget}
+                  pendingScroll={activeTab.pendingScroll ?? null}
+                  onScrollConsumed={stable.clearActiveScroll}
                 />
               );
             })()}
@@ -1484,19 +1562,37 @@ export default function App() {
       {/* key={theme} forces a remount on theme flip so the canvas
           re-resolves CSS-var colours. The component reads them once
           per draw via getComputedStyle but caches some via memos —
-          remounting is cheaper than threading a watcher through. */}
-      <GraphView
-        key={theme}
-        open={graphOpen}
-        theme={theme}
-        activePath={activeFileTab?.path ?? null}
-        onOpenFile={(p) => {
-          setGraphOpen(false);
-          stable.openFile(p);
-        }}
-        onClose={() => setGraphOpen(false)}
-      />
+          remounting is cheaper than threading a watcher through.
+          Gated on `graphOpen` so the lazy chunk doesn't load until the
+          user actually opens the graph view. */}
+      {graphOpen && (
+        <Suspense fallback={null}>
+          <GraphView
+            key={theme}
+            open={graphOpen}
+            theme={theme}
+            activePath={activeFileTab?.path ?? null}
+            onOpenFile={(p) => {
+              setGraphOpen(false);
+              stable.openFile(p);
+            }}
+            onClose={() => setGraphOpen(false)}
+          />
+        </Suspense>
+      )}
       </div>
+    </div>
+  );
+}
+
+// Slim placeholder rendered while a lazy viewer chunk fetches. The
+// chunk arrives in a few hundred ms on first open of each kind; after
+// that webkit/Chromium caches it. Keeping the fallback minimal avoids
+// jank when the suspense boundary unblocks.
+function ViewerLoadingFallback() {
+  return (
+    <div className="workspace-leaf-content flex-1 min-h-0 min-w-0 flex items-center justify-center text-[var(--text-faint)] text-[12px]">
+      Loading viewer…
     </div>
   );
 }

@@ -47,14 +47,21 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { activeLinesField } from "./cm-active-lines";
-import preactSrc from "./widget-runtime/preact.js?raw";
-import preactHooksSrc from "./widget-runtime/preact-hooks.js?raw";
-import htmSrc from "./widget-runtime/htm.js?raw";
-import tailwindSrc from "./widget-runtime/tailwind.js?raw";
-import jsxgraphSrc from "./widget-runtime/jsxgraph.js?raw";
-import jsxgraphCss from "./widget-runtime/jsxgraph.css?raw";
-import chartSrc from "./widget-runtime/chart.js?raw";
-import p5Src from "./widget-runtime/p5.js?raw";
+import type { WidgetRuntimeSources } from "./widget-runtime";
+
+// Lazy-load the 2.6 MB widget runtime (preact + hooks + htm + tailwind +
+// jsxgraph + chart + p5). The whole runtime lives in its own Vite chunk
+// (`./widget-runtime/index.ts`) and is only fetched when a widget first
+// enters the viewport — users who never open a widget pay nothing.
+// First widget per session: one chunk fetch (~few hundred ms cold).
+// Cached for the rest of the session and across re-mounts.
+let _runtimePromise: Promise<WidgetRuntimeSources> | null = null;
+function loadRuntime(): Promise<WidgetRuntimeSources> {
+  if (!_runtimePromise) {
+    _runtimePromise = import("./widget-runtime").then((m) => m.default);
+  }
+  return _runtimePromise;
+}
 
 const DEFAULT_HEIGHT_PX = 320;
 const MIN_HEIGHT_PX = 80;
@@ -416,14 +423,17 @@ function parseInfo(infoLine: string): Parsed {
 // Build the lazy-injected lib block based on the widget's `needs=` flag.
 // Order matters: stylesheets first, then scripts. Each lib is only
 // included if explicitly requested — keeps simple widgets cheap.
-function buildLazyLibs(needs: ReadonlyArray<string>): string {
+function buildLazyLibs(
+  needs: ReadonlyArray<string>,
+  rt: WidgetRuntimeSources,
+): string {
   const parts: string[] = [];
   if (needs.includes("jsxgraph")) {
-    parts.push(`<style>${jsxgraphCss}</style>`);
-    parts.push(`<script>${jsxgraphSrc}</script>`);
+    parts.push(`<style>${rt.jsxgraphCss}</style>`);
+    parts.push(`<script>${rt.jsxgraph}</script>`);
   }
-  if (needs.includes("chart")) parts.push(`<script>${chartSrc}</script>`);
-  if (needs.includes("p5")) parts.push(`<script>${p5Src}</script>`);
+  if (needs.includes("chart")) parts.push(`<script>${rt.chart}</script>`);
+  if (needs.includes("p5")) parts.push(`<script>${rt.p5}</script>`);
   return parts.join("\n");
 }
 
@@ -483,13 +493,13 @@ class HtmlWidget extends WidgetType {
     iframe.style.background = "var(--background-primary)";
     iframe.style.display = "block";
 
-    // Build the srcdoc up front so we can detach + restore on viewport
-    // entry/exit (see IntersectionObserver below). Off-screen iframes
-    // otherwise keep Tailwind JIT + Preact runtime hot, eating layout
-    // /paint cost on every editor scroll — the dominant scroll-perf
-    // win when a doc has 3+ widgets.
+    // Build the srcdoc lazily, only when the wrapper enters the viewport.
+    // The IntersectionObserver below kicks off `loadRuntime()` (a dynamic
+    // import of the 2.6 MB widget runtime chunk) the first time any
+    // widget is about to be displayed; subsequent widgets reuse the
+    // cached promise so the chunk is fetched + parsed once per session.
     //
-    // Load order:
+    // Load order inside the iframe srcdoc:
     //  1. theme CSS (defines --color-* before user CSS reads them)
     //  2. preact -> hooks (hooks UMD looks up window.preact at load)
     //  3. htm
@@ -499,24 +509,22 @@ class HtmlWidget extends WidgetType {
     //  7. lazy libs (only if declared via `needs=`)
     //  8. canvas auto-fix + size reporter (DOMContentLoaded handlers)
     //  9. user body
-    const lazyBlock = buildLazyLibs(this.needs);
-    const fullSrcdoc = `<!doctype html>
+    const buildSrcdoc = (rt: WidgetRuntimeSources): string => {
+      const lazyBlock = buildLazyLibs(this.needs, rt);
+      return `<!doctype html>
 <html><head><meta charset="utf-8"/>
 <style>${this.themeCss}</style>
-<script>${preactSrc}</script>
-<script>${preactHooksSrc}</script>
-<script>${htmSrc}</script>
+<script>${rt.preact}</script>
+<script>${rt.preactHooks}</script>
+<script>${rt.htm}</script>
 <script>${RUNTIME_GLUE}</script>
 <script>${WIDGET_KIT}</script>
-<script>${tailwindSrc}</script>
+<script>${rt.tailwind}</script>
 ${lazyBlock}
 <script>${CANVAS_AUTOFIX}</script>
 <script>${SIZE_REPORTER}</script>
 </head><body>${this.src}</body></html>`;
-    // NOTE: srcdoc is intentionally NOT set yet — the IntersectionObserver
-    // below assigns it the first time the wrapper enters the viewport.
-    // This means a doc with 20 widgets only ever loads the 1-2 currently
-    // on screen, instead of all 20 at first render.
+    };
 
     // Listen for height messages from the iframe (auto-resize). The
     // iframe's SIZE_REPORTER posts {type:'forge-widget-size', h: number}
@@ -595,8 +603,17 @@ ${lazyBlock}
           // scrolled past in the meantime, in which case mounting would
           // be wasted work.
           if (!lastSeenIntersecting || mounted) return;
-          iframe.srcdoc = fullSrcdoc;
+          // Kick off the runtime fetch (cached after the first call).
+          // We mark `mounted` immediately so a second observer hit
+          // doesn't race a duplicate load. If the user scrolls past
+          // before sources resolve we still set srcdoc — small wasted
+          // work, but the runtime promise is shared so it's the same
+          // chunk either way.
           mounted = true;
+          loadRuntime().then((rt) => {
+            // Final guard against tear-down between fetch and apply.
+            if (iframe.isConnected) iframe.srcdoc = buildSrcdoc(rt);
+          });
         });
       };
       // Deferred teardown: when the widget exits viewport, don't tear
@@ -640,8 +657,13 @@ ${lazyBlock}
       );
       io.observe(wrap);
     } else {
-      // No IntersectionObserver (very old browser) — fall back to eager load.
-      iframe.srcdoc = fullSrcdoc;
+      // No IntersectionObserver (very old browser) — fall back to eager
+      // load, but still defer through the runtime fetch so the chunk
+      // is split and we don't have a sync-only escape hatch back into
+      // the bundled-runtime path.
+      loadRuntime().then((rt) => {
+        if (iframe.isConnected) iframe.srcdoc = buildSrcdoc(rt);
+      });
     }
 
     wrap.appendChild(iframe);

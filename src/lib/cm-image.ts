@@ -179,6 +179,21 @@ class ImageWidget extends WidgetType {
       return wrap;
     }
 
+    // We DELIBERATELY do NOT use `content-visibility: auto` or
+    // `loading="lazy"` on image widgets. Both interact badly with
+    // CM6's viewport virtualisation + fast scroll on webkit2gtk:
+    //   - content-visibility: auto eagerly paints when the wrapper
+    //     briefly crosses the viewport's predicted-visible region;
+    //     during a fast scroll past a long image you see a flash of
+    //     the image at a "wrong" (high) position before the browser
+    //     confirms it's offscreen and skips paint.
+    //   - loading="lazy" delays fetch/decode until intersection. If
+    //     the user scrolls past while decode is in flight, the image
+    //     pops in mid-scroll at a perceived-wrong position.
+    // Pre-loaded cached images (the common case after first read) +
+    // pinned width/height attrs are enough to keep scroll stable
+    // without these flags.
+
     const img = document.createElement("img");
     img.alt = this.alt;
     // async decode keeps scrolling buttery — sync would block the

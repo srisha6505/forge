@@ -35,6 +35,52 @@ const INLINE_RE = /(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s|\\)\$/g;
 // Display `$$..$$`, may span multiple lines.
 const DISPLAY_RE = /(?<!\\)\$\$([\s\S]+?)\$\$/g;
 
+// CodeMirror viewport-virtualises line DOM — a single math widget gets
+// mounted and unmounted many times during a long scroll. Without this
+// cache, every mount re-runs katex.renderToString() which is the
+// dominant cost (50-200μs per inline expression, 1-5ms per display
+// block). Caching the rendered HTML string per (src, displayMode) pair
+// turns each re-mount into a single innerHTML assignment.
+//
+// Cache key is `${displayMode ? "d" : "i"}${src}` — display vs inline
+// produce different markup so they can't share entries. Cache size is
+// bounded by `MAX_CACHE_ENTRIES`; eviction is LRU-ish (oldest first)
+// once the cap is hit, which keeps memory steady on documents with
+// many ephemeral math edits.
+const MAX_CACHE_ENTRIES = 512;
+const renderCache = new Map<string, { html: string; error: boolean }>();
+function renderMath(src: string, displayMode: boolean): { html: string; error: boolean } {
+  const key = `${displayMode ? "d" : "i"}${src}`;
+  const cached = renderCache.get(key);
+  if (cached) {
+    // LRU touch — re-insert to bump to most-recent.
+    renderCache.delete(key);
+    renderCache.set(key, cached);
+    return cached;
+  }
+  let entry: { html: string; error: boolean };
+  try {
+    entry = {
+      html: katex.renderToString(src, {
+        displayMode,
+        throwOnError: false,
+        output: "html",
+      }),
+      error: false,
+    };
+  } catch {
+    entry = { html: "", error: true };
+  }
+  renderCache.set(key, entry);
+  if (renderCache.size > MAX_CACHE_ENTRIES) {
+    // Evict the oldest entry. Map preserves insertion order so the
+    // first key is the least-recently-used (or never-touched).
+    const oldest = renderCache.keys().next().value;
+    if (oldest !== undefined) renderCache.delete(oldest);
+  }
+  return entry;
+}
+
 class MathWidget extends WidgetType {
   constructor(
     readonly src: string,
@@ -48,15 +94,12 @@ class MathWidget extends WidgetType {
   toDOM() {
     const el = document.createElement(this.displayMode ? "div" : "span");
     el.className = this.displayMode ? "cm-math-display" : "cm-math-inline";
-    try {
-      el.innerHTML = katex.renderToString(this.src, {
-        displayMode: this.displayMode,
-        throwOnError: false,
-        output: "html",
-      });
-    } catch {
+    const { html, error } = renderMath(this.src, this.displayMode);
+    if (error) {
       el.textContent = this.displayMode ? `$$${this.src}$$` : `$${this.src}$`;
       el.classList.add("cm-math-error");
+    } else {
+      el.innerHTML = html;
     }
     return el;
   }
@@ -218,6 +261,19 @@ const mathTheme = EditorView.theme({
     padding: "8px 0",
     margin: "8px 0",
     textAlign: "center",
+    // Layout containment isolates KaTeX's substantial DOM tree from
+    // the rest of the editor — reflows inside don't bubble out.
+    // `content-visibility: auto` plus a coarse intrinsic-size estimate
+    // tells the browser to skip painting offscreen display-math at
+    // all. The 60px placeholder is a reasonable lower bound; real math
+    // is usually 40-200px tall and the browser corrects to the real
+    // height as it enters the viewport. We skip `paint` containment
+    // because the cm-image comment in this file's neighbour notes that
+    // it confused webkit2gtk's CM measurement; layout + content-vis is
+    // the safe combination.
+    contain: "layout",
+    contentVisibility: "auto",
+    containIntrinsicSize: "auto 60px",
   },
   ".cm-math-display:hover": {
     backgroundColor: "var(--background-modifier-hover)",

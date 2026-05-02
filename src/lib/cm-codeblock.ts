@@ -188,6 +188,12 @@ const codeChromeTheme = EditorView.theme({
     borderBottom:
       "1px solid var(--background-modifier-border)",
     userSelect: "none",
+    // Layout containment so the chrome's flex layout doesn't bubble
+    // reflow up into the editor's main flow. The chrome is small and
+    // its content is fixed in size, so layout-only containment gives
+    // the win without risking webkit2gtk's CM measurement bug noted
+    // in cm-image.ts.
+    contain: "layout",
   },
   ".cm-codechrome-lang": {
     textTransform: "uppercase",
