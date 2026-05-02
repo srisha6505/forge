@@ -1,6 +1,6 @@
 [package]
 name = "forge"
-version = "0.2.0"
+version = "0.2.3"
 edition = "2024"
 license = "AGPL-3.0"
 description = "Rust-backend markdown editor with AI research agent"
