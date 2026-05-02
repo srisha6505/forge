@@ -1033,8 +1033,6 @@ function ProvidersTab(props: ProvidersProps) {
   const {
     settings,
     update,
-    models,
-    progress,
     copilot,
     copilotModelList,
     deviceCode,
@@ -1042,18 +1040,16 @@ function ProvidersTab(props: ProvidersProps) {
     startCopilotLogin,
     logoutCopilot,
     copyCode,
-    refreshModels,
     vaultSettings,
     updateProviderConfig,
     providerTests,
     providerModels,
     providerTesting,
     runProviderTest,
-    caps,
   } = props;
 
-  const llmModels = models.filter((m) => m.kind === "llm");
-  const downloadedLlm = llmModels.filter((m) => m.downloaded);
+  // LLM model catalogue removed with the local-LLM strip. Whisper and
+  // Piper still live under Voice settings.
 
   // Pull provider config out of vault settings with safe defaults so the
   // inputs are always controlled even before the file exists.
@@ -1383,90 +1379,10 @@ function ProvidersTab(props: ProvidersProps) {
         </ProviderCard>
       </div>
 
-      {caps.local_llm && (
-      <ProviderCard
-        name="Local GGUF (in-process)"
-        status={settings.model_path ? "connected" : "idle"}
-        active={settings.ai_provider === "local"}
-        onActivate={() => update("ai_provider", "local")}
-        statusLabel={
-          settings.model_path ? "model loaded" : "no model loaded"
-        }
-      >
-        <FieldRow label="Model">
-          {downloadedLlm.length === 0 ? (
-            <span
-              style={{
-                flex: 1,
-                fontSize: "var(--font-ui-small)",
-                color: "var(--text-faint)",
-                fontStyle: "italic",
-              }}
-            >
-              No local models downloaded yet — use the catalogue below.
-            </span>
-          ) : (
-            <select
-              value={settings.model_path ?? ""}
-              onChange={(e) => update("model_path", e.target.value || null)}
-              style={selectStyle}
-            >
-              <option value="" disabled>
-                Select a model…
-              </option>
-              {downloadedLlm.map((m) => (
-                <option key={m.id} value={m.local_path ?? ""}>
-                  {m.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </FieldRow>
-        <FieldRow label="GPU layers">
-          <InputField
-            type="number"
-            value={String(settings.gpu_layers)}
-            onChange={(v) => update("gpu_layers", parseInt(v || "0", 10))}
-            style={{ width: 100 }}
-          />
-        </FieldRow>
-        <FieldRow label="Context">
-          <InputField
-            type="number"
-            value={String(settings.ctx_size)}
-            onChange={(v) => update("ctx_size", parseInt(v || "0", 10))}
-            style={{ width: 100 }}
-          />
-        </FieldRow>
-        <Divider style={{ margin: "12px 0" }} />
-        <div
-          style={{
-            fontSize: "var(--font-ui-smaller)",
-            fontWeight: 600,
-            color: "var(--text-muted)",
-            textTransform: "uppercase",
-            letterSpacing: "0.04em",
-            marginBottom: 8,
-          }}
-        >
-          Catalogue
-        </div>
-        <DownloadList
-          entries={llmModels}
-          progress={progress}
-          onDownload={(id) => startModelDownload(id)}
-          onCancel={(id) => cancelModelDownload(id)}
-          onDelete={async (id) => {
-            await deleteModel(id);
-            refreshModels();
-            const m = llmModels.find((x) => x.id === id);
-            if (m && settings.model_path === m.local_path) {
-              update("model_path", null);
-            }
-          }}
-        />
-      </ProviderCard>
-      )}
+      {/* Local GGUF (in-process) provider was here — removed when Forge
+          stopped bundling llama.cpp. Local models now run via Ollama
+          through the openai_compat provider. The catalogue below now
+          only lists STT (Whisper) and TTS (Piper) downloads. */}
     </>
   );
 }
@@ -1478,7 +1394,6 @@ const ROUTING_PROVIDERS: { id: string; label: string }[] = [
   { id: "gemini", label: "Gemini" },
   { id: "copilot", label: "Copilot" },
   { id: "openai_compat", label: "OpenAI-compatible" },
-  { id: "local", label: "Local GGUF" },
 ];
 
 interface RoutingProps {
@@ -1497,7 +1412,6 @@ function RoutingCard({
   current,
   providerModels,
   updateSlot,
-  caps,
 }: {
   slot: string;
   slotKey: keyof VaultSettings["ai"]["routing"];
@@ -1507,7 +1421,6 @@ function RoutingCard({
     slot: keyof VaultSettings["ai"]["routing"],
     next: RoutedModel | null,
   ) => void;
-  caps: { local_llm: boolean };
 }) {
   const provider = current?.provider ?? "";
   const model = current?.model ?? "";
@@ -1543,9 +1456,7 @@ function RoutingCard({
           style={selectStyle}
         >
           <option value="">(none)</option>
-          {ROUTING_PROVIDERS.filter(
-            (p) => caps.local_llm || p.id !== "local",
-          ).map((p) => (
+          {ROUTING_PROVIDERS.map((p) => (
             <option key={p.id} value={p.id}>
               {p.label}
             </option>
@@ -1586,7 +1497,6 @@ function RoutingTab({
   vaultSettings,
   providerModels,
   updateRoutingSlot,
-  caps,
 }: RoutingProps) {
   if (!vaultSettings) {
     return (
@@ -1612,7 +1522,6 @@ function RoutingTab({
         current={r.chat}
         providerModels={providerModels}
         updateSlot={updateRoutingSlot}
-        caps={caps}
       />
       <RoutingCard
         slot="Fast"
@@ -1620,7 +1529,6 @@ function RoutingTab({
         current={r.fast}
         providerModels={providerModels}
         updateSlot={updateRoutingSlot}
-        caps={caps}
       />
       <RoutingCard
         slot="Summarise"
@@ -1628,7 +1536,6 @@ function RoutingTab({
         current={r.summarise}
         providerModels={providerModels}
         updateSlot={updateRoutingSlot}
-        caps={caps}
       />
       <RoutingCard
         slot="Embed"
@@ -1636,7 +1543,6 @@ function RoutingTab({
         current={r.embed}
         providerModels={providerModels}
         updateSlot={updateRoutingSlot}
-        caps={caps}
       />
     </div>
   );

@@ -33,7 +33,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
 notify = "7"
-llama-cpp-2 = { version = "0.1", features = ["cuda"], optional = true }
 hound = "3"
 cpal = "0.15"
 rand = "0.8"
@@ -63,9 +62,8 @@ default = []
 
 # Re-export tauri custom-protocol when building production bundle
 custom-protocol = ["tauri/custom-protocol"]
-
-# Bundle the local llama.cpp + CUDA inference runtime. Adds ~150-250 MB
-# to the binary. Without this, the lite build is ~80% smaller and users
-# run local LLMs via Ollama (over the openai_compat HTTP API). API
-# providers (Anthropic / OpenAI / Gemini / Copilot) work in both builds.
-local-llm = ["dep:llama-cpp-2"]
+# Local LLM (llama.cpp/CUDA) inference is *not* part of Forge any more.
+# Users wanting local models run Ollama and point Forge at it via the
+# OpenAI-compatible HTTP path. A separate runtime (Hearth) handles
+# embedded inference; keeping it out of Forge cuts ~150-250 MB of
+# binary and ~30-60 s of cold compile.

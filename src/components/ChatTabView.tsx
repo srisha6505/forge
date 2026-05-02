@@ -13,13 +13,13 @@ import { Send, Sparkles } from "./ui/Icons";
 import { MessageBlock, type UiMessage } from "./chat/MessageBlock";
 import { RunningIndicator } from "./chat/RunningIndicator";
 import { ChatModelPicker, type PickerModel } from "./chat/ChatModelPicker";
+import { VoiceInput } from "./VoiceInput";
 import TOCPanel, { type Heading } from "./TOCPanel";
 import {
   connectInference,
   copilotModels,
   getSettings,
   getVaultSettings,
-  listModels,
   listProviderModels,
   loadChat,
   onChatDone,
@@ -349,7 +349,6 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
         // storage convention (legacy Settings vs vault.ai.providers).
         let curId = "";
         if (active === "copilot") curId = s.copilot_model || "";
-        else if (active === "local") curId = s.model_path || "";
         else if (vaultPath) {
           try {
             const vs = await getVaultSettings(vaultPath);
@@ -365,15 +364,6 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
           if (active === "copilot") {
             const cp = await copilotModels();
             list = cp.map((m) => ({ id: m.id, name: m.name, vendor: m.vendor }));
-          } else if (active === "local") {
-            const all = await listModels();
-            list = all
-              .filter((m) => m.kind === "llm" && m.downloaded && m.local_path)
-              .map((m) => ({
-                id: m.local_path as string,
-                name: m.name,
-                vendor: "Local",
-              }));
           } else if (active === "openai" || active === "anthropic" || active === "gemini" || active === "openai_compat") {
             // Pull api_key + base_url from vault settings so listProviderModels
             // can call the provider's enumeration endpoint.
@@ -419,8 +409,6 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
         const s = await getSettings();
         if (provider === "copilot") {
           await setSettings({ ...s, copilot_model: modelId });
-        } else if (provider === "local") {
-          await setSettings({ ...s, model_path: modelId });
         } else if (provider && vaultPath) {
           // Per-vault provider config — set default_model.
           const vs = await getVaultSettings(vaultPath);
@@ -455,6 +443,28 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
     },
     [busy, switching, currentModelId, provider, vaultPath],
   );
+
+  // Auto-connect on mount: try the saved provider/model once silently.
+  // Mirrors the same effect in Chat.tsx — if anything is configured we
+  // come up "connected" with the right label; if nothing is, we stay
+  // at "not connected" without an error toast and retry on next send.
+  useEffect(() => {
+    if (connected) return;
+    let cancelled = false;
+    connectInference()
+      .then((res) => {
+        if (cancelled) return;
+        setModelLabel(res.model_name);
+        setConnected(true);
+      })
+      .catch(() => {
+        // Expected when no provider is configured yet.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const send = async () => {
     const text = input.trim();
@@ -731,6 +741,7 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
                     <MessageBlock
                       msg={m}
                       isLast={i === messages.length - 1}
+                      assistantLabel={modelLabel === "not connected" ? undefined : modelLabel}
                       onSaveAsNote={
                         m.kind === "assistant" && !m.streaming
                           ? () => onSaveResponseAsNote(i)
@@ -763,14 +774,20 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
                 border: "1px solid var(--background-modifier-border)",
                 borderRadius: "var(--radius-m)",
                 display: "flex",
-                alignItems: "center",
+                alignItems: "flex-end",
                 padding: "6px 10px",
                 gap: 8,
               }}
             >
-          <input
+          <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            rows={1}
+            onChange={(e) => {
+              setInput(e.target.value);
+              const ta = e.currentTarget;
+              ta.style.height = "auto";
+              ta.style.height = Math.min(ta.scrollHeight, 144) + "px";
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -778,7 +795,7 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
                 else send();
               }
             }}
-            placeholder={busy ? "Streaming..." : "Ask anything…"}
+            placeholder={busy ? "Streaming..." : "Ask anything… (Shift+Enter for newline)"}
             disabled={busy}
             style={{
               flex: 1,
@@ -788,7 +805,19 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
               fontSize: "var(--font-ui-medium)",
               color: "var(--text-normal)",
               minWidth: 0,
+              resize: "none",
+              fontFamily: "inherit",
+              lineHeight: 1.45,
+              padding: "4px 0",
+              maxHeight: 144,
+              overflowY: "auto",
             }}
+          />
+          <VoiceInput
+            onTranscript={(t) =>
+              setInput((prev) => (prev ? prev + (prev.endsWith(" ") ? "" : " ") + t : t))
+            }
+            disabled={busy}
           />
           <button
             onClick={busy ? stop : send}
@@ -808,6 +837,8 @@ const ChatTabView = forwardRef<ChatTabHandle, Props>(function ChatTabView(
               alignItems: "center",
               justifyContent: "center",
               cursor: input.trim() || busy ? "pointer" : "default",
+              flexShrink: 0,
+              alignSelf: "flex-end",
             }}
           >
             <Send size={14} />

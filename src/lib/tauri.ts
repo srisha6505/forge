@@ -27,9 +27,6 @@ export interface Settings {
   mono_font: string;
   font_size: number;
   sidebar_width: number;
-  model_path: string | null;
-  gpu_layers: number;
-  ctx_size: number;
   chat_panel_width: number;
   max_tool_iterations: number;
   ai_provider: string;
@@ -397,11 +394,10 @@ export interface GpuStatus {
 // ── Build capabilities ────────────────────────────────────────────────
 
 export interface RuntimeCapabilities {
-  /** True if the bundled llama.cpp + CUDA runtime is in this build.
-   *  Lite builds set this to false; the local GGUF tab and model-download
-   *  manager hide themselves and `connect_inference` errors out if the
-   *  user picks the local provider. Local LLMs in lite builds run via
-   *  Ollama through the openai_compat provider. */
+  /** Permanently false now that Forge has no embedded inference runtime.
+   *  Kept on the type so downstream code that probes capabilities still
+   *  type-checks; treat as a constant in any new code. Local models
+   *  run via Ollama through the openai_compat provider. */
   local_llm: boolean;
 }
 
@@ -411,8 +407,8 @@ let _capsPromise: Promise<RuntimeCapabilities> | null = null;
 export const runtimeCapabilities = (): Promise<RuntimeCapabilities> => {
   if (!_capsPromise) {
     _capsPromise = invoke<RuntimeCapabilities>("runtime_capabilities").catch(
-      // Older backends without the command: assume full build.
-      () => ({ local_llm: true }),
+      // Older backends without the command: assume no local LLM.
+      () => ({ local_llm: false }),
     );
   }
   return _capsPromise;

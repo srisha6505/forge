@@ -296,8 +296,6 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
- "log",
- "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -669,15 +667,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "codespan-reporting"
@@ -1617,15 +1606,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "find_cuda_helper"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f9e65c593dd01ac77daad909ea4ad17f0d6d1776193fc8ea766356177abdad"
-dependencies = [
- "glob",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,7 +1688,6 @@ dependencies = [
  "dirs 5.0.1",
  "hf-hub",
  "hound",
- "llama-cpp-2",
  "notify",
  "openssl",
  "portable-pty",
@@ -3262,34 +3241,6 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
-
-[[package]]
-name = "llama-cpp-2"
-version = "0.1.143"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d564eb5d7ae88f596e7636ffd549e0f27f4c938a7c7841bb91e2a92c248c9ccb"
-dependencies = [
- "encoding_rs",
- "enumflags2",
- "llama-cpp-sys-2",
- "thiserror 2.0.18",
- "tracing",
- "tracing-core",
-]
-
-[[package]]
-name = "llama-cpp-sys-2"
-version = "0.1.143"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f2cf3435dbadb87817e0a95325c818cd89d43026e8ba1ddd32f1d980d96f33d"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
- "find_cuda_helper",
- "glob",
- "walkdir",
-]
 
 [[package]]
 name = "lock_api"
@@ -6613,7 +6564,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
 ]
 
 [[package]]
@@ -6898,12 +6848,6 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"

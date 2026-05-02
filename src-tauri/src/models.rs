@@ -25,7 +25,6 @@ use tauri::Emitter;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelKind {
-    Llm,
     Stt,
     Tts,
 }
@@ -33,7 +32,6 @@ pub enum ModelKind {
 impl ModelKind {
     pub fn dir(&self) -> &'static str {
         match self {
-            ModelKind::Llm => "llm",
             ModelKind::Stt => "stt",
             ModelKind::Tts => "tts",
         }
@@ -101,51 +99,6 @@ pub fn entry_config_path(entry: &CatalogEntry) -> Option<PathBuf> {
 /// options. URLs point at Hugging Face / public mirrors.
 pub fn catalog() -> Vec<CatalogEntry> {
     vec![
-        // ── LLMs ──────────────────────────────────────────────────────
-        CatalogEntry {
-            id: "gemma-4-e4b-it-q8".into(),
-            kind: ModelKind::Llm,
-            name: "Gemma 4 E4B Instruct (Q8_0)".into(),
-            description: "Google Gemma 4, 7.5B params (4.5B active), Q8_0 quant. ~7.6 GB. Native function-calling + JSON mode + 128k context. Best small local model for agents and JSON-spec widget generation. Tested on RTX 3060.".into(),
-            size_bytes: 7_600_000_000,
-            filename: "gemma-4-E4B-it-Q8_0.gguf".into(),
-            url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf".into(),
-            config_url: None,
-            config_filename: None,
-        },
-        CatalogEntry {
-            id: "gemma-3-4b-it-q4".into(),
-            kind: ModelKind::Llm,
-            name: "Gemma 3 4B Instruct (Q4_K_M)".into(),
-            description: "Google Gemma 3, 4B params, quantised to Q4_K_M. ~2.5 GB. Good balance of quality and CPU speed. Superseded by Gemma 4 E4B for new work.".into(),
-            size_bytes: 2_600_000_000,
-            filename: "gemma-3-4b-it-Q4_K_M.gguf".into(),
-            url: "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf".into(),
-            config_url: None,
-            config_filename: None,
-        },
-        CatalogEntry {
-            id: "gemma-3-1b-it-q4".into(),
-            kind: ModelKind::Llm,
-            name: "Gemma 3 1B Instruct (Q4_K_M)".into(),
-            description: "Smallest Gemma 3, 1B params, quantised. ~800 MB. Fastest, limited reasoning.".into(),
-            size_bytes: 806_000_000,
-            filename: "gemma-3-1b-it-Q4_K_M.gguf".into(),
-            url: "https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q4_K_M.gguf".into(),
-            config_url: None,
-            config_filename: None,
-        },
-        CatalogEntry {
-            id: "qwen2.5-3b-instruct-q4".into(),
-            kind: ModelKind::Llm,
-            name: "Qwen 2.5 3B Instruct (Q4_K_M)".into(),
-            description: "Alibaba Qwen 2.5, 3B params, quantised. ~2 GB. Strong multilingual + tool-use.".into(),
-            size_bytes: 2_000_000_000,
-            filename: "qwen2.5-3b-instruct-Q4_K_M.gguf".into(),
-            url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf".into(),
-            config_url: None,
-            config_filename: None,
-        },
         // ── Whisper STT ───────────────────────────────────────────────
         CatalogEntry {
             id: "whisper-tiny".into(),

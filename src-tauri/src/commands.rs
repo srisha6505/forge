@@ -534,30 +534,18 @@ pub fn connect_inference(
             .ok_or_else(|| "openai_compat requires a default_model in vault settings".to_string())?;
         llm::spawn_openai_compat_thread(key, base_url, model).map_err(|e| e.to_string())?
     } else {
-        // Local llama.cpp path. In the lite build (no `local-llm`
-        // feature) this branch is replaced by an error so the rest of
-        // the function still compiles. Users on the lite build run
-        // local LLMs via Ollama through the openai_compat provider.
-        #[cfg(feature = "local-llm")]
-        {
-            let path = settings
-                .model_path
-                .clone()
-                .ok_or_else(|| "No model_path set in settings".to_string())?;
-            llm::spawn_inference_thread(&path, settings.gpu_layers, settings.ctx_size)
-                .map_err(|e| e.to_string())?
-        }
-        #[cfg(not(feature = "local-llm"))]
-        {
-            let _ = &settings;
-            return Err(
-                "This Forge build doesn't bundle local llama.cpp. \
-                 Pick an API provider (Anthropic/OpenAI/Gemini/Copilot) \
-                 or run Ollama and configure it via the openai_compat provider \
-                 (base_url http://localhost:11434/v1)."
-                    .to_string(),
-            );
-        }
+        // Embedded llama.cpp inference is no longer part of Forge —
+        // a separate runtime (Hearth) handles local inference. To run
+        // local models with Forge today, use Ollama through the
+        // openai_compat provider (base_url http://localhost:11434/v1).
+        let _ = &settings;
+        return Err(
+            "Forge no longer bundles a local LLM runtime. \
+             Pick an API provider (Anthropic/OpenAI/Gemini/Copilot) \
+             or run Ollama and select the openai_compat provider \
+             (base_url http://localhost:11434/v1)."
+                .to_string(),
+        );
     };
 
     let name = handle.model_name.clone();
@@ -1259,24 +1247,18 @@ pub fn copilot_logout(state: State<'_, AppState>) -> Result<(), String> {
 // ── Build capabilities ────────────────────────────────────────────────
 
 /// Reports which optional subsystems were compiled into this build.
-/// The frontend reads this on boot to decide whether to expose UI for
-/// the local LLM tab, the model-download manager, etc. Unknown future
-/// flags should default to `false` on the JS side.
+/// Kept for forward compatibility — `local_llm` is permanently false
+/// now that Forge has no embedded inference runtime, but the shape
+/// exists so the frontend's boot probe doesn't fail and so a future
+/// re-add of capabilities (e.g. CUDA, Metal) has a place to land.
 #[derive(serde::Serialize)]
 pub struct RuntimeCapabilities {
-    /// True if `llama-cpp-2` is linked in (i.e., the `local-llm`
-    /// Cargo feature was enabled at build time). When false, the
-    /// "Local GGUF" provider tab and model-download UI should be
-    /// hidden, and `connect_inference` returns an error if the user
-    /// somehow selects the local provider anyway.
     pub local_llm: bool,
 }
 
 #[tauri::command]
 pub fn runtime_capabilities() -> RuntimeCapabilities {
-    RuntimeCapabilities {
-        local_llm: cfg!(feature = "local-llm"),
-    }
+    RuntimeCapabilities { local_llm: false }
 }
 
 // ── Models catalog + downloads ────────────────────────────────────────

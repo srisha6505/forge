@@ -281,12 +281,10 @@ pub struct Settings {
     pub font_size: f32,
     #[serde(default = "legacy_default_sidebar_width")]
     pub sidebar_width: f32,
-    #[serde(default)]
-    pub model_path: Option<PathBuf>,
-    #[serde(default = "default_gpu_layers")]
-    pub gpu_layers: u32,
-    #[serde(default = "default_ctx_size")]
-    pub ctx_size: u32,
+    // model_path / gpu_layers / ctx_size were the configuration surface
+    // for embedded llama.cpp inference. With local LLM removed, they're
+    // dead weight in the schema. Kept off the struct entirely; serde
+    // ignores unknown fields so old settings.json files still load.
     #[serde(default = "default_chat_width")]
     pub chat_panel_width: f32,
     #[serde(default = "default_max_tool_iters")]
@@ -333,11 +331,11 @@ pub fn default_mono_font() -> String { "DejaVu Sans Mono".to_string() }
 pub fn default_font_size() -> f32 { 15.0 }
 // Renamed to avoid collision with the new u32-typed default_sidebar_width().
 pub fn legacy_default_sidebar_width() -> f32 { 260.0 }
-pub fn default_gpu_layers() -> u32 { 99 }
-pub fn default_ctx_size() -> u32 { 16384 }
 pub fn default_chat_width() -> f32 { 400.0 }
 pub fn default_max_tool_iters() -> usize { 10 }
-pub fn legacy_default_provider() -> String { "local".into() }
+// Default provider after the local-LLM strip. Empty string means
+// "no provider chosen" — frontend nudges the user toward a real one.
+pub fn legacy_default_provider() -> String { String::new() }
 pub fn default_api_model() -> String { "claude-sonnet-4-6".into() }
 pub fn default_copilot_model() -> String { "claude-sonnet-4".into() }
 pub fn default_stt_provider() -> String { "local".into() }
@@ -359,9 +357,6 @@ impl Default for Settings {
             mono_font: default_mono_font(),
             font_size: default_font_size(),
             sidebar_width: legacy_default_sidebar_width(),
-            model_path: None,
-            gpu_layers: default_gpu_layers(),
-            ctx_size: default_ctx_size(),
             chat_panel_width: default_chat_width(),
             max_tool_iterations: default_max_tool_iters(),
             ai_provider: legacy_default_provider(),
